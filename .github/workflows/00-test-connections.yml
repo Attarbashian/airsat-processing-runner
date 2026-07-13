@@ -1,0 +1,68 @@
+name: 00 - Test AirSat Connections
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout public runner files
+        uses: actions/checkout@v4
+        with:
+          path: runner
+
+      - name: Checkout private airsat-auto repository
+        uses: actions/checkout@v4
+        with:
+          repository: Attarbashian/airsat-auto
+          ref: main
+          token: ${{ secrets.AIRSAT_AUTO_PAT }}
+          fetch-depth: 0
+          path: target
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Earth Engine client
+        run: python -m pip install --upgrade earthengine-api
+
+      - name: Verify required target folders
+        run: |
+          set -euo pipefail
+          test -d target/public/data
+          test -d target/public/visual_real
+          echo "Target repository and output folders are available."
+
+      - name: Verify Earth Engine authentication
+        env:
+          EE_SERVICE_ACCOUNT_JSON: ${{ secrets.EE_SERVICE_ACCOUNT_JSON }}
+          EE_PROJECT: ${{ secrets.EE_PROJECT }}
+        run: |
+          python - <<'PY'
+          import json, os
+          import ee
+          raw = os.environ.get("EE_SERVICE_ACCOUNT_JSON", "")
+          project = os.environ.get("EE_PROJECT", "")
+          if not raw or not project:
+              raise SystemExit("Missing EE_SERVICE_ACCOUNT_JSON or EE_PROJECT")
+          info = json.loads(raw)
+          credentials = ee.ServiceAccountCredentials(
+              info["client_email"], key_data=json.dumps(info)
+          )
+          ee.Initialize(credentials, project=project)
+          print("Earth Engine authentication succeeded for project:", project)
+          PY
+
+      - name: Verify push authorization without changing repository
+        working-directory: target
+        run: |
+          set -euo pipefail
+          git push --dry-run origin HEAD:main
+          echo "Read/write authorization for airsat-auto is available."
