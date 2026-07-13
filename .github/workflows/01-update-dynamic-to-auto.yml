@@ -1,0 +1,94 @@
+name: 01 - Update Dynamic Layers to airsat-auto
+
+on:
+  workflow_dispatch:
+    inputs:
+      pollutants:
+        description: "ابتدا فقط یک آلاینده را اجرا کن"
+        required: true
+        default: NO2
+        type: choice
+        options: [NO2, SO2, CO, O3, HCHO, AER_AI, CH4, all]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: airsat-auto-data-writer
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      AIRSAT_REPOSITORY_ROOT: ${{ github.workspace }}/target
+      SELECTED_POLLUTANTS: ${{ inputs.pollutants }}
+    steps:
+      - name: Checkout public runner files
+        uses: actions/checkout@v4
+        with:
+          path: runner
+
+      - name: Checkout private airsat-auto repository
+        uses: actions/checkout@v4
+        with:
+          repository: Attarbashian/airsat-auto
+          ref: main
+          token: ${{ secrets.AIRSAT_AUTO_PAT }}
+          fetch-depth: 0
+          path: target
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: runner/requirements-actions.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r runner/requirements-actions.txt
+
+      - name: Build rolling layers directly inside airsat-auto
+        env:
+          AIRSAT_BUILD_MODE: daily
+          AIRSAT_START_YEAR: "2018"
+          AIRSAT_THUMB_DIMENSIONS: "1200"
+          AIRSAT_STATS_SCALE: "7000"
+          AIRSAT_STATS_CRS: "EPSG:4326"
+          AIRSAT_WEB_CRS: "EPSG:3857"
+          AIRSAT_BOUNDARY_SIMPLIFY_M: "100"
+          AIRSAT_EXPECTED_PROVINCE_COUNT: "31"
+          AIRSAT_VISUAL_GAP_FILL: "true"
+          AIRSAT_VISUAL_GAP_FILL_RADII_KM: "10,30,75"
+          AIRSAT_VISUAL_FINAL_MEAN_FILL: "true"
+          AIRSAT_POLLUTANTS: ${{ inputs.pollutants }}
+          EE_SERVICE_ACCOUNT_JSON: ${{ secrets.EE_SERVICE_ACCOUNT_JSON }}
+          EE_PROJECT: ${{ secrets.EE_PROJECT }}
+          EE_PROVINCES_ASSET: ${{ secrets.EE_PROVINCES_ASSET }}
+          EE_PROVINCE_NAME_FIELD: ${{ secrets.EE_PROVINCE_NAME_FIELD }}
+        run: python runner/scripts/build_airsat_static.py
+
+      - name: Validate dynamic outputs
+        run: >-
+          python runner/scripts/validate_airsat_outputs.py
+          --pollutants "${SELECTED_POLLUTANTS}"
+          --groups dynamic
+          --require-stats
+
+      - name: Commit outputs to private airsat-auto
+        working-directory: target
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add public/data public/visual_real
+          if git diff --staged --quiet; then
+            echo "No generated changes"
+          else
+            git commit -m "auto: update ${SELECTED_POLLUTANTS} dynamic layers"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
