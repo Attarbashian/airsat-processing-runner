@@ -51,6 +51,12 @@ def parse_groups(value: str):
         x.strip().lower() for x in value.split(",") if x.strip()
     }
 
+def parse_periods(value: str):
+    value = value.strip()
+    return None if not value or value.lower() == "all" else {
+        x.strip() for x in value.split(",") if x.strip()
+    }
+
 
 def finite(value: Any) -> bool:
     try:
@@ -193,6 +199,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pollutants", default="all")
     parser.add_argument("--groups", default="all", help="dynamic,annual,range or all")
+    parser.add_argument("--periods", default="all", help="Comma-separated period keys")
     parser.add_argument("--require-stats", action="store_true")
     parser.add_argument("--require-timeseries", action="store_true")
     parser.add_argument("--skip-layers", action="store_true", help="Validate only time-series files")
@@ -204,11 +211,14 @@ def main() -> int:
         return 1
     selected = parse_pollutants(args.pollutants)
     groups = parse_groups(args.groups)
+    periods = parse_periods(args.periods)
     layers = read_json(CATALOG).get("layers", [])
     if selected is not None:
         layers = [l for l in layers if str(l.get("pollutant", "")).upper() in selected]
     if groups is not None:
         layers = [l for l in layers if str(l.get("period_group", "")).lower() in groups]
+    if periods is not None:
+        layers = [l for l in layers if str(l.get("period_key", "")) in periods]
 
     expected = expected_province_count()
     errors: list[str] = []
@@ -234,7 +244,7 @@ def main() -> int:
         return 1
     print(
         f"VALIDATION PASSED: {count} available layers; "
-        f"expected provinces={expected}; groups={args.groups}"
+        f"expected provinces={expected}; groups={args.groups}; periods={args.periods}"
     )
     return 0
 

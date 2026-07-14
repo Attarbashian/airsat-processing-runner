@@ -15,7 +15,7 @@ from PIL import Image
 from rasterio.io import MemoryFile
 from rasterio.warp import transform_bounds
 
-PIPELINE_VERSION = "airsat-pipeline-v6.0-georef-stats-gapfill"
+PIPELINE_VERSION = "airsat-pipeline-v6.7-segmented-georef-stats-gapfill"
 ROOT = Path(os.environ.get("AIRSAT_REPOSITORY_ROOT", str(Path(__file__).resolve().parents[1]))).expanduser().resolve()
 PUBLIC = ROOT / "public"
 DATA = PUBLIC / "data"
@@ -44,6 +44,17 @@ VISUAL_GAP_FILL_RADII_KM = [
 VISUAL_FINAL_MEAN_FILL = os.getenv("AIRSAT_VISUAL_FINAL_MEAN_FILL", "true").strip().lower() not in {"0", "false", "no", "off"}
 EXPECTED_PROVINCE_COUNT = int(os.getenv("AIRSAT_EXPECTED_PROVINCE_COUNT", "31"))
 BUILD_TIMESERIES = os.getenv("AIRSAT_BUILD_TIMESERIES", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+ONLY_PERIOD_KEYS = {
+    item.strip()
+    for item in os.getenv("AIRSAT_PERIOD_KEYS", "").split(",")
+    if item.strip()
+}
+TIMESERIES_YEAR_RAW = os.getenv("AIRSAT_TIMESERIES_YEAR", "").strip()
+TIMESERIES_YEAR = int(TIMESERIES_YEAR_RAW) if TIMESERIES_YEAR_RAW else None
+SKIP_EXISTING = os.getenv("AIRSAT_SKIP_EXISTING", "true").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 
 POLLUTANTS: dict[str, dict[str, Any]] = {
     # Earth Engine OFFL/L3 products are already screened during L2 -> L3
@@ -177,8 +188,41 @@ def dynamic_periods(latest: date):
 
 def monthly_periods_from_start():
     out=[]; cur=date(START_YEAR,1,1); stop=NOW.date().replace(day=1)
-    while cur<stop: out.append((cur.strftime("%Y-%m"),cur,add_months(cur,1))); cur=add_months(cur,1)
+    while cur<stop:
+        if TIMESERIES_YEAR is None or cur.year == TIMESERIES_YEAR:
+            out.append((cur.strftime("%Y-%m"),cur,add_months(cur,1)))
+        cur=add_months(cur,1)
     return out
+
+def select_periods(periods):
+    if not ONLY_PERIOD_KEYS:
+        return periods
+    missing = sorted(ONLY_PERIOD_KEYS - set(periods))
+    if missing:
+        raise RuntimeError(
+            f"Requested period keys are not valid for build mode {BUILD_MODE}: {missing}"
+        )
+    return {key: value for key, value in periods.items() if key in ONLY_PERIOD_KEYS}
+
+def existing_layer_is_complete(pid, key, existing_layers):
+    if not SKIP_EXISTING:
+        return False
+    layer = next(
+        (
+            item for item in existing_layers
+            if item.get("pollutant") == pid and item.get("period_key") == key
+        ),
+        None,
+    )
+    if not layer or not layer.get("available"):
+        return False
+    visual_path = PUBLIC / str(layer.get("visual_path", "")).lstrip("/")
+    georef_path = PUBLIC / str(layer.get("georef_path", "")).lstrip("/")
+    stats_path = STATS / pid / f"{key}.json"
+    complete = visual_path.exists() and georef_path.exists() and stats_path.exists()
+    if complete:
+        print("Skip complete existing layer:", pid, key)
+    return complete
 
 def ee_init():
     key_json=os.getenv("EE_SERVICE_ACCOUNT_JSON"); project=os.getenv("EE_PROJECT")
@@ -421,7 +465,7 @@ def download_georeferenced_webp(image,cfg,country,out_path):
     with MemoryFile(tif) as mem:
         with mem.open() as ds:
             meta=validate_geotiff(ds,expected); rgba=build_rgba(ds); west,south,east,north=transform_bounds(ds.crs,"EPSG:4326",ds.bounds.left,ds.bounds.bottom,ds.bounds.right,ds.bounds.top,densify_pts=21)
-    out_path.parent.mkdir(parents=True,exist_ok=True); Image.fromarray(rgba,"RGBA").save(out_path,"WEBP",quality=90,method=6,exact=True)
+    out_path.parent.mkdir(parents=True,exist_ok=True); Image.fromarray(rgba).save(out_path,"WEBP",quality=90,method=6,exact=True)
     meta.update({"web_bounds":[[south,west],[north,east]],"requested_scale_m":scale,"webp_sha256":sha256_file(out_path),"temporary_geotiff_sha256":sha256_bytes(tif),"webp_path":f"/{out_path.relative_to(PUBLIC).as_posix()}"})
     return meta
 
@@ -515,8 +559,34 @@ def build_layer(pid,cfg,key,pinfo,country,fc):
     return layer
 
 def build_ts(pid,cfg,fc,country,province_catalog):
+    periods = monthly_periods_from_start()
+    if not periods:
+        raise RuntimeError(
+            f"No completed monthly periods are available for TIMESERIES_YEAR={TIMESERIES_YEAR}"
+        )
+    selected_labels = {label for label, _, _ in periods}
+    existing_payload = read_json(TIMESERIES/f"{pid}.json", {})
     table={p["id"]:{"id":p["id"],"name_fa":p["name_fa"],"series":[]} for p in province_catalog}
-    for label,s,e in monthly_periods_from_start():
+
+    for province in existing_payload.get("provinces", []) or []:
+        province_id = province.get("id")
+        if not province_id:
+            continue
+        item = table.setdefault(
+            province_id,
+            {
+                "id": province_id,
+                "name_fa": province.get("name_fa") or province_id,
+                "series": [],
+            },
+        )
+        item["series"] = [
+            point
+            for point in (province.get("series") or [])
+            if point.get("period") not in selected_labels
+        ]
+
+    for label,s,e in periods:
         print("Timeseries",pid,label)
         image,count,_=ordinary_composite(cfg,s,e,country)
         if image is None or count<=0:
@@ -530,6 +600,11 @@ def build_ts(pid,cfg,fc,country,province_catalog):
                 "period":label,"value":row["mean"],"min":row["min"],"max":row["max"],
                 "image_count":count,"interpolated":False
             })
+    for item in table.values():
+        item["series"] = sorted(
+            item.get("series") or [],
+            key=lambda point: str(point.get("period") or "")
+        )
     provinces=sorted(table.values(),key=lambda x:x["name_fa"])
     write_json(TIMESERIES/f"{pid}.json",{
         "pollutant":pid,"label":cfg["label"],"name_fa":cfg["name_fa"],
@@ -567,6 +642,9 @@ def main():
     print("PIPELINE_VERSION:",PIPELINE_VERSION)
     print("BUILD_MODE:",BUILD_MODE)
     print("VISUAL_GAP_FILL:",VISUAL_GAP_FILL, VISUAL_GAP_FILL_RADII_KM)
+    print("ONLY_PERIOD_KEYS:", sorted(ONLY_PERIOD_KEYS))
+    print("TIMESERIES_YEAR:", TIMESERIES_YEAR)
+    print("SKIP_EXISTING:", SKIP_EXISTING)
     ee_init()
     asset=os.getenv("EE_PROVINCES_ASSET")
     if not asset:
@@ -585,7 +663,8 @@ def main():
     existing=read_json(CATALOG/"layers.json",{"layers":[]}).get("layers",[])
     ids,partial=selected_pollutants()
 
-    if BUILD_MODE=="timeseries":
+    if BUILD_MODE=="timeseries" or ONLY_PERIOD_KEYS:
+        # Segmented builds update only their selected period and preserve the rest.
         layers=existing[:]
     elif BUILD_MODE=="daily":
         layers=[l for l in existing if l.get("period_group") in {"annual","range"} or str(l.get("period_key","")).startswith(("annual_","range_"))]
@@ -593,8 +672,7 @@ def main():
     elif BUILD_MODE=="ranges":
         layers=existing[:]
     else:
-        # Rebuilding one pollutant removes stale entries for that pollutant.
-        # Multi-year ranges are deliberately rebuilt by the ranges workflow.
+        # Full bootstrap rebuilding one pollutant removes stale entries for that pollutant.
         layers=[l for l in existing if l.get("pollutant") not in ids] if partial else []
 
     for pid in ids:
@@ -614,9 +692,13 @@ def main():
                 periods=dynamic_periods(latest)
             else:
                 periods=annual_periods()
-                if latest is not None:
+                if latest is not None and not ONLY_PERIOD_KEYS:
                     periods.update(dynamic_periods(latest))
+        periods = select_periods(periods)
+        print("Selected period keys:", list(periods))
         for key,pinfo in periods.items():
+            if existing_layer_is_complete(pid, key, layers):
+                continue
             layer=build_layer(pid,cfg,key,pinfo,country,fc)
             layers=[l for l in layers if l.get("id")!=layer["id"]]
             layers.append(layer)
