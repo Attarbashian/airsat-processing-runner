@@ -7,6 +7,11 @@ on:
         description: Supabase download_requests UUID
         required: true
         type: string
+      force_rebuild:
+        description: Rebuild and overwrite an already-ready request
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -18,11 +23,20 @@ concurrency:
 jobs:
   process:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - name: Checkout public processing repository
         uses: actions/checkout@v4
+
+      - name: Checkout private airsat-auto time-series data
+        uses: actions/checkout@v4
+        with:
+          repository: Attarbashian/airsat-auto
+          ref: main
+          token: ${{ secrets.AIRSAT_AUTO_PAT }}
+          fetch-depth: 1
+          path: target
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -32,11 +46,14 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install earthengine-api requests pillow
+          python -m pip install earthengine-api requests pillow arabic-reshaper python-bidi
 
       - name: Process AirSat request
         env:
           REQUEST_ID: ${{ inputs.request_id }}
+          FORCE_REBUILD_REQUEST: ${{ inputs.force_rebuild }}
+          AIRSAT_AUTO_ROOT: ${{ github.workspace }}/target
+          AIRSAT_TIMESERIES_FALLBACK: "true"
           EE_SERVICE_ACCOUNT_JSON: ${{ secrets.EE_SERVICE_ACCOUNT_JSON }}
           EE_PROJECT: ${{ secrets.EE_PROJECT }}
           EE_PROVINCES_ASSET: ${{ secrets.EE_PROVINCES_ASSET }}
