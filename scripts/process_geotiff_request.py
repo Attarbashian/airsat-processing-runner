@@ -496,106 +496,159 @@ def draw_timeseries_chart(
     cfg: dict[str, Any],
     source: str,
 ) -> None:
-    width, height = 1400, 820
-    image = Image.new("RGB", (width, height), "#f1f5f9")
+    width, height = 1600, 1080
+    image = Image.new("RGB", (width, height), "#dfe7ef")
     draw = ImageDraw.Draw(image)
 
-    # Main report card.
-    draw.rounded_rectangle((28, 28, width - 28, height - 28), radius=28, fill="white")
-    draw.text(
-        (70, 62),
-        display_text(f"AirSat | {row['pollutant']} | {row.get('province_name') or 'Iran'}"),
-        fill="#10263d",
-        font=font(30),
-    )
-    draw.text(
-        (70, 112),
-        f"Monthly time series | 2018–present | Unit: {cfg['unit']}",
-        fill="#64748b",
-        font=font(18),
-    )
+    draw.rounded_rectangle((34, 30, width - 34, height - 34), radius=30, fill="#eef3f8")
+    generated = datetime.now().strftime("%Y-%m-%d, %H:%M UTC")
+    title = f"Monthly time series of {row['pollutant']} in {row.get('province_name') or 'Iran'}"
+    draw_header(draw, width, title, generated)
 
-    left, top, right, bottom = 115, 190, width - 80, height - 135
-    draw.rounded_rectangle((left, top, right, bottom), radius=14, fill="#f8fafc", outline="#cbd5e1", width=2)
+    body = (64, 200, width - 64, 870)
+    draw.rounded_rectangle(body, radius=28, fill="#f8fbfd", outline="#c9d6e3", width=2)
 
+    chart_left, chart_top, chart_right, chart_bottom = 300, 320, width - 400, 710
     values = [float(item["value"]) for item in series]
     minimum, maximum = min(values), max(values)
-    if math.isclose(minimum, maximum):
-        padding = abs(minimum) * 0.08 or 1.0
-    else:
-        padding = (maximum - minimum) * 0.08
+    padding = (maximum - minimum) * 0.12 if not math.isclose(minimum, maximum) else abs(minimum) * 0.08 or 1.0
     y_min, y_max = minimum - padding, maximum + padding
 
-    # Grid and y labels.
+    # legend
+    legend_y = 260
+    draw.line((500, legend_y, 540, legend_y), fill="#135fb3", width=5)
+    draw.text((548, legend_y - 12), display_text("Observed"), fill="#425b76", font=font(16))
+    draw.line((700, legend_y, 740, legend_y), fill="#9ab5d4", width=3)
+    draw.text((748, legend_y - 12), display_text("Trend"), fill="#425b76", font=font(16))
+
+    # grid
     for step in range(6):
-        y = top + (bottom - top) * step / 5
+        y = chart_top + (chart_bottom - chart_top) * step / 5
         value = y_max - (y_max - y_min) * step / 5
-        draw.line((left, y, right, y), fill="#e2e8f0", width=1)
-        draw.text((38, y - 10), f"{value:.3g}", fill="#64748b", font=font(15))
+        draw.line((chart_left, y, chart_right, y), fill="#d7e2ee", width=1)
+        label = format_value(value)
+        tw = draw.textlength(label, font=font(16))
+        draw.text((chart_left - tw - 16, y - 10), label, fill="#5d748c", font=font(16))
 
     count = len(series)
     points = []
     for index, item in enumerate(series):
-        x = left if count == 1 else left + (right - left) * index / (count - 1)
-        y = bottom - (float(item["value"]) - y_min) * (bottom - top) / (y_max - y_min)
+        x = chart_left if count == 1 else chart_left + (chart_right - chart_left) * index / (count - 1)
+        y = chart_bottom - (float(item["value"]) - y_min) * (chart_bottom - chart_top) / (y_max - y_min)
         points.append((x, y))
 
+    # trend line
+    slope, intercept, r2 = compute_linear_trend(values)
+    trend_points = []
+    for index in range(count):
+        trend = slope * index + intercept
+        x = chart_left if count == 1 else chart_left + (chart_right - chart_left) * index / (count - 1)
+        y = chart_bottom - (trend - y_min) * (chart_bottom - chart_top) / (y_max - y_min)
+        trend_points.append((x, y))
+    if len(trend_points) > 1:
+        draw.line(trend_points, fill="#9ab5d4", width=3)
+
     if len(points) > 1:
-        draw.line(points, fill="#0284c7", width=4, joint="curve")
-    for x, y in points[::max(1, len(points)//24)]:
-        draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill="#0f766e")
+        draw.line(points, fill="#135fb3", width=5)
+    for x, y in points:
+        draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill="#135fb3")
 
-    # One label per year where possible.
-    last_year = None
-    for index, item in enumerate(series):
-        year = item["period"][:4]
-        if year == last_year:
-            continue
-        last_year = year
-        x = left if count == 1 else left + (right - left) * index / (count - 1)
-        draw.line((x, bottom, x, bottom + 7), fill="#64748b", width=1)
-        draw.text((x - 19, bottom + 14), year, fill="#475569", font=font(14))
+    # x-axis labels tilted, one or two per year
+    label_indices = []
+    if count <= 18:
+        label_indices = list(range(count))
+    else:
+        seen = set()
+        for i, item in enumerate(series):
+            year = item['period'][:4]
+            if year not in seen:
+                label_indices.append(i)
+                seen.add(year)
 
+    for i in label_indices:
+        x, _ = points[i]
+        label = series[i]['period']
+        draw.line((x, chart_bottom, x, chart_bottom + 7), fill="#6e8297", width=1)
+        temp = Image.new('RGBA', (110, 32), (0, 0, 0, 0))
+        temp_draw = ImageDraw.Draw(temp)
+        temp_draw.text((0, 8), label, fill="#5b7087", font=font(14))
+        rotated = temp.rotate(55, expand=1)
+        image.paste(rotated, (int(x - 24), chart_bottom + 10), rotated)
+
+    draw.text((chart_right - 95, chart_bottom + 140), "© AirSat", fill="#8ca0b5", font=font(16))
+
+    mean_value = sum(values) / len(values)
+    min_value = min(values)
+    max_value = max(values)
     latest = series[-1]
-    draw.text(
-        (70, height - 91),
-        f"Latest: {latest['period']} = {latest['value']:.6g} {cfg['unit']}",
-        fill="#0f766e",
-        font=font(18),
-    )
-    draw.text(
-        (width - 500, height - 91),
-        f"Source: {source} | airsat.ir",
-        fill="#64748b",
-        font=font(15),
-    )
-    image.save(output, "PNG", optimize=True)
+
+    footer_top = 895
+    draw.rounded_rectangle((64, footer_top, width - 64, height - 70), radius=20, fill="#dde7f0", outline="#c2d0de", width=1)
+    draw.text((88, footer_top + 28), display_text(f"Maximum: {format_value(max_value)}   |   Minimum: {format_value(min_value)}   |   Mean: {format_value(mean_value)}"), fill="#334b63", font=font(20))
+    draw.text((88, footer_top + 74), f"Source: {source}", fill="#60788f", font=font(16))
+    draw.text((88, footer_top + 112), f"Linear trend: y = {slope:.3e}x + {intercept:.3e}  |  R² = {r2:.3f}", fill="#334b63", font=font(18))
+
+    info_right_x = width - 570
+    draw.text((info_right_x, footer_top + 30), display_text(f"Pollutant: {row['pollutant']}   |   Province: {row.get('province_name') or 'Iran'}"), fill="#1f3850", font=font(22))
+    draw.text((info_right_x, footer_top + 78), display_text(f"Unit: {cfg['unit']}   |   Latest month: {latest['period']}"), fill="#35516d", font=font(18))
+    draw.text((info_right_x, footer_top + 114), display_text(f"n = {len(series)} monthly points   |   airsat.ir"), fill="#35516d", font=font(18))
+
+    draw.text((width / 2 - 230, height - 48), "© AirSat  •  Satellite-powered air monitoring for Iran  •  Sentinel-5P / TROPOMI  •  airsat.ir", fill="#6f8396", font=font(17))
+    image.save(output, 'PNG', optimize=True)
 
 
-def write_shortcuts(folder: Path) -> tuple[Path, Path]:
+def write_shortcut(folder: Path) -> Path:
     windows_shortcut = folder / "AirSat.url"
     windows_shortcut.write_text(
         "[InternetShortcut]\nURL=https://airsat.ir\n",
         encoding="utf-8",
     )
+    return windows_shortcut
 
-    html_shortcut = folder / "Open_AirSat.html"
-    html_shortcut.write_text(
-        """<!doctype html>
-<html lang="fa" dir="rtl">
-<head>
-<meta charset="utf-8">
-<meta http-equiv="refresh" content="0; url=https://airsat.ir">
-<title>Open AirSat</title>
-</head>
-<body>
-<p><a href="https://airsat.ir">ورود به سامانه AirSat</a></p>
-</body>
-</html>
-""",
-        encoding="utf-8",
-    )
-    return windows_shortcut, html_shortcut
+
+def format_value(value: float) -> str:
+    absolute = abs(float(value))
+    if absolute == 0:
+        return "0"
+    if absolute >= 100:
+        return f"{value:.1f}"
+    if absolute >= 10:
+        return f"{value:.2f}"
+    if absolute >= 1:
+        return f"{value:.3f}"
+    return f"{value:.3e}".replace("e-0", "e-").replace("e+0", "e+")
+
+
+def draw_header(draw: ImageDraw.ImageDraw, width: int, title: str, generated_at: str) -> None:
+    header_top = 30
+    header_bottom = 165
+    # clean blue brand bar, with a reserved brand zone on the right.
+    draw.rounded_rectangle((34, header_top, width - 34, header_bottom), radius=28, fill="#16508f")
+    brand_x = width - 280
+    draw.text((72, header_top + 42), "Sentinel-5P / TROPOMI  •  Google Earth Engine  •  airsat.ir", fill="white", font=font(17))
+    draw.text((72, header_top + 82), generated_at, fill="#d9ecff", font=font(15))
+    draw.text((brand_x + 54, header_top + 24), "AirSat", fill="white", font=font(38))
+    draw.text((brand_x + 56, header_top + 74), "Satellite-powered air monitoring for Iran", fill="#d9ecff", font=font(12))
+    # Title kept clearly away from the brand area.
+    title_text = display_text(title)
+    title_w = draw.textlength(title_text, font=font(24))
+    title_x = max(420, brand_x - title_w - 28)
+    draw.text((title_x, header_top + 68), title_text, fill="white", font=font(24))
+
+
+def compute_linear_trend(values: list[float]) -> tuple[float, float, float]:
+    n = len(values)
+    xs = list(range(n))
+    mean_x = sum(xs) / n
+    mean_y = sum(values) / n
+    sxx = sum((x - mean_x) ** 2 for x in xs)
+    sxy = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, values))
+    slope = sxy / sxx if sxx else 0.0
+    intercept = mean_y - slope * mean_x
+    ss_tot = sum((y - mean_y) ** 2 for y in values)
+    ss_res = sum((y - (slope * x + intercept)) ** 2 for x, y in zip(xs, values))
+    r2 = 1 - ss_res / ss_tot if ss_tot else 0.0
+    return slope, intercept, r2
 
 
 def compose_preview(
@@ -607,53 +660,55 @@ def compose_preview(
     end: str,
 ) -> None:
     raw = Image.open(raw_png).convert("RGBA")
-    width = 1400
-    map_height = round(raw.height * width / raw.width)
-    header_height = 130
-    footer_height = 230
+    width, height = 1600, 1080
+    image = Image.new("RGB", (width, height), "#dfe7ef")
+    draw = ImageDraw.Draw(image)
 
-    canvas = Image.new("RGB", (width, header_height + map_height + footer_height), "white")
-    resized = raw.resize((width, map_height), Image.Resampling.LANCZOS)
-    canvas.paste(resized, (0, header_height), resized)
+    draw.rounded_rectangle((34, 30, width - 34, height - 34), radius=30, fill="#eef3f8")
+    generated = datetime.now().strftime("%Y-%m-%d, %H:%M UTC")
+    title = f"Spatial map of {row['pollutant']} in {row.get('province_name') or 'Iran'}"
+    draw_header(draw, width, title, generated)
 
-    draw = ImageDraw.Draw(canvas)
-    region = row.get("province_name") or "Iran"
-    draw.text((36, 24), display_text(f"AirSat | {row['pollutant']} | {region}"), fill="#10263d", font=font(28))
-    draw.text(
-        (36, 70),
-        f"{start} – {end}   |   Sentinel-5P / TROPOMI   |   Google Earth Engine",
-        fill="#64748b",
-        font=font(18),
-    )
+    body = (64, 200, width - 64, 840)
+    draw.rounded_rectangle(body, radius=28, fill="#f8fbfd", outline="#c9d6e3", width=2)
 
-    footer_y = header_height + map_height
-    draw.rectangle((0, footer_y, width, canvas.height), fill="#f8fafc")
-    draw.text(
-        (36, footer_y + 28),
-        f"Unit: {cfg['unit']}   |   Display range: {cfg['min']} to {cfg['max']}",
-        fill="#334155",
-        font=font(18),
-    )
-    draw.text(
-        (36, footer_y + 72),
-        f"Period: {row.get('period_key') or start + ' to ' + end}",
-        fill="#475569",
-        font=font(17),
-    )
-    draw.text(
-        (36, footer_y + 122),
-        "AirSat – Satellite-Based Air Pollution Monitoring System for Iran",
-        fill="#0f766e",
-        font=font(19),
-    )
-    draw.text(
-        (36, footer_y + 166),
-        "airsat.ir",
-        fill="#64748b",
-        font=font(16),
-    )
+    map_box = (115, 255, width - 115, 760)
+    box_w = map_box[2] - map_box[0]
+    box_h = map_box[3] - map_box[1]
+    raw_ratio = raw.width / raw.height
+    box_ratio = box_w / box_h
+    if raw_ratio > box_ratio:
+        new_w = box_w
+        new_h = round(box_w / raw_ratio)
+    else:
+        new_h = box_h
+        new_w = round(box_h * raw_ratio)
+    resized = raw.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    offset_x = map_box[0] + (box_w - new_w) // 2
+    offset_y = map_box[1] + (box_h - new_h) // 2
+    draw.rounded_rectangle(map_box, radius=18, fill="white", outline="#d8e2eb", width=2)
+    image.paste(resized, (offset_x, offset_y), resized)
 
-    canvas.save(output_png, "PNG", optimize=True)
+    footer_top = 865
+    draw.rounded_rectangle((64, footer_top, width - 64, height - 70), radius=20, fill="#dde7f0", outline="#c2d0de", width=1)
+    region = row.get('province_name') or 'Iran'
+    left_lines = [
+        display_text(f"Pollutant: {row['pollutant']}   |   Region: {region}"),
+        display_text(f"Period: {row.get('period_key') or (start + ' to ' + end)}   |   Unit: {cfg['unit']}"),
+        display_text(f"Date range: {start}  →  {end}   |   airsat.ir"),
+    ]
+    right_lines = [
+        display_text(f"Nominal display range: {format_value(cfg['min'])}  to  {format_value(cfg['max'])}"),
+        display_text("Source: Sentinel-5P / TROPOMI | Google Earth Engine"),
+        display_text("Preview map packed with GeoTIFF export"),
+    ]
+    for idx, line in enumerate(left_lines):
+        draw.text((92, footer_top + 28 + idx * 38), line, fill="#28435d", font=font(20 if idx == 0 else 18))
+    for idx, line in enumerate(right_lines):
+        draw.text((900, footer_top + 28 + idx * 38), line, fill="#526b83", font=font(17))
+
+    draw.text((width / 2 - 230, height - 48), "© AirSat  •  Satellite-powered air monitoring for Iran  •  Sentinel-5P / TROPOMI  •  airsat.ir", fill="#6f8396", font=font(17))
+    image.save(output_png, 'PNG', optimize=True)
 
 
 def safe_filename(value: str) -> str:
@@ -788,7 +843,7 @@ def main() -> None:
                         series_source,
                     )
 
-            windows_shortcut, html_shortcut = write_shortcuts(folder)
+            windows_shortcut = write_shortcut(folder)
 
             metadata.write_text(
                 "\n".join(
@@ -821,7 +876,6 @@ def main() -> None:
                     preview,
                     metadata,
                     windows_shortcut,
-                    html_shortcut,
                 ]
                 if series:
                     files.extend([timeseries_chart, timeseries_csv, timeseries_json])
@@ -846,7 +900,7 @@ def main() -> None:
                     "object_path": object_path,
                     "file_name": output_zip.name,
                     "expires_at": expires_at.isoformat(),
-                    "message": "بسته شامل GeoTIFF، نقشه قاب‌دار و در صورت انتخاب استان، سری زمانی است؛ تا ۲۴ ساعت قابل دانلود خواهد بود.",
+                    "message": "بسته شامل GeoTIFF، نقشه و سری زمانی در قالب گزارش AirSat و یک میانبر به سایت است؛ تا ۲۴ ساعت قابل دانلود خواهد بود.",
                     "error": None,
                 },
             )
