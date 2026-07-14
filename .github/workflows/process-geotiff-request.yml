@@ -1,0 +1,46 @@
+name: Process AirSat GeoTIFF Request
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: Supabase download_requests UUID
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: airsat-geotiff-${{ inputs.request_id }}
+  cancel-in-progress: false
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout public processing repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade earthengine-api requests pillow
+
+      - name: Process AirSat request
+        env:
+          REQUEST_ID: ${{ inputs.request_id }}
+          EE_SERVICE_ACCOUNT_JSON: ${{ secrets.EE_SERVICE_ACCOUNT_JSON }}
+          EE_PROJECT: ${{ secrets.EE_PROJECT }}
+          EE_PROVINCES_ASSET: ${{ secrets.EE_PROVINCES_ASSET }}
+          EE_PROVINCE_NAME_FIELD: ${{ secrets.EE_PROVINCE_NAME_FIELD }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          EXPORT_BUCKET: airsat-exports
+        run: python scripts/process_geotiff_request.py
