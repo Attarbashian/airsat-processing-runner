@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import csv
 import json
+import math
 import os
 import re
 import shutil
@@ -17,6 +19,13 @@ from urllib.parse import quote
 import ee
 import requests
 from PIL import Image, ImageDraw, ImageFont
+
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+except Exception:  # Optional visual improvement only.
+    arabic_reshaper = None
+    get_display = None
 
 
 POLLUTANTS: dict[str, dict[str, Any]] = {
@@ -287,6 +296,308 @@ def font(size: int) -> ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
+
+def display_text(value: Any) -> str:
+    """Shape Persian/Arabic text correctly when optional packages are installed."""
+    text = str(value or "")
+    if arabic_reshaper is not None and get_display is not None and re.search(r"[\u0600-\u06FF]", text):
+        return get_display(arabic_reshaper.reshape(text))
+    return text
+
+
+def normalize_name(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    replacements = {
+        "ي": "ی",
+        "ك": "ک",
+        "\u200c": "",
+        " ": "",
+        "-": "",
+        "_": "",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
+
+def load_precomputed_timeseries(row: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
+    """Load province time series already generated in the private airsat-auto repo."""
+    if not row.get("province_name"):
+        return [], "not-applicable"
+
+    root_raw = os.getenv("AIRSAT_AUTO_ROOT", "").strip()
+    if not root_raw:
+        return [], "private-repository-not-mounted"
+
+    path = Path(root_raw) / "public" / "data" / "timeseries" / f"{row['pollutant']}.json"
+    if not path.exists():
+        return [], "precomputed-file-not-found"
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return [], "precomputed-file-invalid"
+
+    metadata = row.get("metadata") or {}
+    wanted_id = normalize_name(metadata.get("province_id") or row.get("province_id"))
+    wanted_name = normalize_name(row.get("province_name"))
+
+    best = None
+    for province in payload.get("provinces", []) or []:
+        candidates = {
+            normalize_name(province.get("id")),
+            normalize_name(province.get("name_fa")),
+            normalize_name(province.get("name_en")),
+        }
+        if wanted_id and wanted_id in candidates:
+            best = province
+            break
+        if wanted_name and wanted_name in candidates:
+            best = province
+            break
+
+    if not best:
+        return [], "province-not-found-in-precomputed-file"
+
+    series = []
+    for point in best.get("series", []) or []:
+        value = point.get("value")
+        if value is None:
+            continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        series.append(
+            {
+                "period": str(point.get("period") or ""),
+                "value": value,
+                "min": point.get("min"),
+                "max": point.get("max"),
+                "image_count": point.get("image_count"),
+                "interpolated": bool(point.get("interpolated", False)),
+            }
+        )
+
+    series.sort(key=lambda item: item["period"])
+    return series, "airsat-auto-precomputed"
+
+
+def month_ranges(start_year: int = 2018):
+    today = datetime.now(timezone.utc).date()
+    stop = today.replace(day=1)
+    current = date(start_year, 1, 1)
+
+    while current < stop:
+        if current.month == 12:
+            following = date(current.year + 1, 1, 1)
+        else:
+            following = date(current.year, current.month + 1, 1)
+        yield current.strftime("%Y-%m"), current.isoformat(), following.isoformat()
+        current = following
+
+
+def compute_region_timeseries(
+    cfg: dict[str, Any],
+    region: ee.Geometry,
+) -> tuple[list[dict[str, Any]], str]:
+    """Fallback: calculate completed monthly means for the selected province."""
+    if os.getenv("AIRSAT_TIMESERIES_FALLBACK", "true").lower() not in {
+        "1", "true", "yes", "on"
+    }:
+        return [], "fallback-disabled"
+
+    base = ee.ImageCollection(cfg["collection"]).filterBounds(region)
+    if cfg["qa"] is not None:
+        base = base.map(lambda image: apply_qa_if_available(image, cfg["qa"]))
+
+    features = []
+    for label, start, end in month_ranges(2018):
+        monthly = base.filterDate(start, end)
+        monthly_mean = monthly.select(cfg["band"]).mean()
+        reduced = monthly_mean.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=region,
+            scale=7000,
+            bestEffort=True,
+            maxPixels=1e13,
+            tileScale=4,
+        )
+        features.append(
+            ee.Feature(
+                None,
+                {
+                    "period": label,
+                    "value": reduced.get(cfg["band"]),
+                    "image_count": monthly.size(),
+                },
+            )
+        )
+
+    payload = ee.FeatureCollection(features).getInfo()
+    series = []
+    for feature in payload.get("features", []):
+        properties = feature.get("properties", {})
+        value = properties.get("value")
+        count = properties.get("image_count") or 0
+        if value is None or count <= 0:
+            continue
+        series.append(
+            {
+                "period": str(properties.get("period") or ""),
+                "value": float(value),
+                "min": None,
+                "max": None,
+                "image_count": int(count),
+                "interpolated": False,
+            }
+        )
+
+    series.sort(key=lambda item: item["period"])
+    return series, "earth-engine-monthly-fallback"
+
+
+def write_timeseries_files(
+    series: list[dict[str, Any]],
+    csv_path: Path,
+    json_path: Path,
+    row: dict[str, Any],
+    cfg: dict[str, Any],
+    source: str,
+) -> None:
+    with csv_path.open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=["period", "value", "min", "max", "image_count", "interpolated"],
+        )
+        writer.writeheader()
+        writer.writerows(series)
+
+    json_path.write_text(
+        json.dumps(
+            {
+                "pollutant": row["pollutant"],
+                "province": row.get("province_name"),
+                "unit": cfg["unit"],
+                "source": source,
+                "series": series,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def draw_timeseries_chart(
+    series: list[dict[str, Any]],
+    output: Path,
+    row: dict[str, Any],
+    cfg: dict[str, Any],
+    source: str,
+) -> None:
+    width, height = 1400, 820
+    image = Image.new("RGB", (width, height), "#f1f5f9")
+    draw = ImageDraw.Draw(image)
+
+    # Main report card.
+    draw.rounded_rectangle((28, 28, width - 28, height - 28), radius=28, fill="white")
+    draw.text(
+        (70, 62),
+        display_text(f"AirSat | {row['pollutant']} | {row.get('province_name') or 'Iran'}"),
+        fill="#10263d",
+        font=font(30),
+    )
+    draw.text(
+        (70, 112),
+        f"Monthly time series | 2018–present | Unit: {cfg['unit']}",
+        fill="#64748b",
+        font=font(18),
+    )
+
+    left, top, right, bottom = 115, 190, width - 80, height - 135
+    draw.rounded_rectangle((left, top, right, bottom), radius=14, fill="#f8fafc", outline="#cbd5e1", width=2)
+
+    values = [float(item["value"]) for item in series]
+    minimum, maximum = min(values), max(values)
+    if math.isclose(minimum, maximum):
+        padding = abs(minimum) * 0.08 or 1.0
+    else:
+        padding = (maximum - minimum) * 0.08
+    y_min, y_max = minimum - padding, maximum + padding
+
+    # Grid and y labels.
+    for step in range(6):
+        y = top + (bottom - top) * step / 5
+        value = y_max - (y_max - y_min) * step / 5
+        draw.line((left, y, right, y), fill="#e2e8f0", width=1)
+        draw.text((38, y - 10), f"{value:.3g}", fill="#64748b", font=font(15))
+
+    count = len(series)
+    points = []
+    for index, item in enumerate(series):
+        x = left if count == 1 else left + (right - left) * index / (count - 1)
+        y = bottom - (float(item["value"]) - y_min) * (bottom - top) / (y_max - y_min)
+        points.append((x, y))
+
+    if len(points) > 1:
+        draw.line(points, fill="#0284c7", width=4, joint="curve")
+    for x, y in points[::max(1, len(points)//24)]:
+        draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill="#0f766e")
+
+    # One label per year where possible.
+    last_year = None
+    for index, item in enumerate(series):
+        year = item["period"][:4]
+        if year == last_year:
+            continue
+        last_year = year
+        x = left if count == 1 else left + (right - left) * index / (count - 1)
+        draw.line((x, bottom, x, bottom + 7), fill="#64748b", width=1)
+        draw.text((x - 19, bottom + 14), year, fill="#475569", font=font(14))
+
+    latest = series[-1]
+    draw.text(
+        (70, height - 91),
+        f"Latest: {latest['period']} = {latest['value']:.6g} {cfg['unit']}",
+        fill="#0f766e",
+        font=font(18),
+    )
+    draw.text(
+        (width - 500, height - 91),
+        f"Source: {source} | airsat.ir",
+        fill="#64748b",
+        font=font(15),
+    )
+    image.save(output, "PNG", optimize=True)
+
+
+def write_shortcuts(folder: Path) -> tuple[Path, Path]:
+    windows_shortcut = folder / "AirSat.url"
+    windows_shortcut.write_text(
+        "[InternetShortcut]\nURL=https://airsat.ir\n",
+        encoding="utf-8",
+    )
+
+    html_shortcut = folder / "Open_AirSat.html"
+    html_shortcut.write_text(
+        """<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="0; url=https://airsat.ir">
+<title>Open AirSat</title>
+</head>
+<body>
+<p><a href="https://airsat.ir">ورود به سامانه AirSat</a></p>
+</body>
+</html>
+""",
+        encoding="utf-8",
+    )
+    return windows_shortcut, html_shortcut
+
+
 def compose_preview(
     raw_png: Path,
     output_png: Path,
@@ -307,7 +618,7 @@ def compose_preview(
 
     draw = ImageDraw.Draw(canvas)
     region = row.get("province_name") or "Iran"
-    draw.text((36, 24), f"AirSat | {row['pollutant']} | {region}", fill="#10263d", font=font(28))
+    draw.text((36, 24), display_text(f"AirSat | {row['pollutant']} | {region}"), fill="#10263d", font=font(28))
     draw.text(
         (36, 70),
         f"{start} – {end}   |   Sentinel-5P / TROPOMI   |   Google Earth Engine",
@@ -369,7 +680,10 @@ def main() -> None:
     request_id = required("REQUEST_ID")
     row = get_request(request_id)
 
-    if row["status"] == "ready":
+    force_rebuild = os.getenv("FORCE_REBUILD_REQUEST", "false").lower() in {
+        "1", "true", "yes", "on"
+    }
+    if row["status"] == "ready" and not force_rebuild:
         print("Request is already ready; nothing to do.")
         return
     if row["status"] in {"cancelled", "expired"}:
@@ -418,7 +732,10 @@ def main() -> None:
             downloaded = folder / "earthengine_download.bin"
             geotiff = folder / f"{base}.tif"
             raw_preview = folder / "preview_raw.png"
-            preview = folder / f"{base}_preview.png"
+            preview = folder / f"{base}_map.png"
+            timeseries_chart = folder / f"{base}_timeseries.png"
+            timeseries_csv = folder / f"{base}_timeseries.csv"
+            timeseries_json = folder / f"{base}_timeseries.json"
             metadata = folder / "metadata.txt"
             output_zip = folder / f"{base}.zip"
 
@@ -446,6 +763,33 @@ def main() -> None:
             download_file(thumbnail_url, raw_preview)
             compose_preview(raw_preview, preview, row, cfg, start, end)
 
+            series = []
+            series_source = "not-applicable"
+            if row.get("province_name"):
+                series, series_source = load_precomputed_timeseries(row)
+                if not series:
+                    print(f"Precomputed time series unavailable: {series_source}")
+                    series, series_source = compute_region_timeseries(cfg, region)
+
+                if series:
+                    write_timeseries_files(
+                        series,
+                        timeseries_csv,
+                        timeseries_json,
+                        row,
+                        cfg,
+                        series_source,
+                    )
+                    draw_timeseries_chart(
+                        series,
+                        timeseries_chart,
+                        row,
+                        cfg,
+                        series_source,
+                    )
+
+            windows_shortcut, html_shortcut = write_shortcuts(folder)
+
             metadata.write_text(
                 "\n".join(
                     [
@@ -459,6 +803,8 @@ def main() -> None:
                         f"Region: {row.get('province_name') or 'Iran'}",
                         f"Unit: {cfg['unit']}",
                         f"Sentinel-5P image count: {count}",
+                        f"Province time-series points: {len(series)}",
+                        f"Province time-series source: {series_source}",
                         f"Collection: {cfg['collection']}",
                         f"Band: {cfg['band']}",
                         f"Nominal export scale: 7000 m",
@@ -470,7 +816,16 @@ def main() -> None:
             )
 
             with zipfile.ZipFile(output_zip, "w", zipfile.ZIP_DEFLATED) as archive:
-                for file in (geotiff, preview, metadata):
+                files = [
+                    geotiff,
+                    preview,
+                    metadata,
+                    windows_shortcut,
+                    html_shortcut,
+                ]
+                if series:
+                    files.extend([timeseries_chart, timeseries_csv, timeseries_json])
+                for file in files:
                     archive.write(file, file.name)
 
             # Free Supabase projects currently cap an individual file at 50 MB.
@@ -491,7 +846,7 @@ def main() -> None:
                     "object_path": object_path,
                     "file_name": output_zip.name,
                     "expires_at": expires_at.isoformat(),
-                    "message": "فایل آماده است و تا ۲۴ ساعت قابل دانلود خواهد بود.",
+                    "message": "بسته شامل GeoTIFF، نقشه قاب‌دار و در صورت انتخاب استان، سری زمانی است؛ تا ۲۴ ساعت قابل دانلود خواهد بود.",
                     "error": None,
                 },
             )
