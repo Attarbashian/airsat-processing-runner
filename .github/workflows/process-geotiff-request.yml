@@ -43,8 +43,21 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Persian Vazir font and Python dependencies
         run: |
+          set -euo pipefail
+
+          sudo mkdir -p /usr/local/share/fonts/airsat
+
+          sudo curl --fail --location --retry 3             "https://cdn.jsdelivr.net/gh/rastikerdar/vazir-font@v30.1.0/dist/Vazir-Regular.ttf"             --output /usr/local/share/fonts/airsat/Vazir-Regular.ttf
+
+          sudo curl --fail --location --retry 3             "https://cdn.jsdelivr.net/gh/rastikerdar/vazir-font@v30.1.0/dist/Vazir-Bold.ttf"             --output /usr/local/share/fonts/airsat/Vazir-Bold.ttf
+
+          sudo fc-cache -f -v
+
+          test -s /usr/local/share/fonts/airsat/Vazir-Regular.ttf
+          test -s /usr/local/share/fonts/airsat/Vazir-Bold.ttf
+
           python -m pip install --upgrade pip
           python -m pip install earthengine-api requests pillow arabic-reshaper python-bidi
 
@@ -53,6 +66,7 @@ jobs:
           REQUEST_ID: ${{ inputs.request_id }}
           FORCE_REBUILD_REQUEST: ${{ inputs.force_rebuild }}
           AIRSAT_AUTO_ROOT: ${{ github.workspace }}/target
+          AIRSAT_FONT_DIR: /usr/local/share/fonts/airsat
           AIRSAT_TIMESERIES_FALLBACK: "true"
           EE_SERVICE_ACCOUNT_JSON: ${{ secrets.EE_SERVICE_ACCOUNT_JSON }}
           EE_PROJECT: ${{ secrets.EE_PROJECT }}
