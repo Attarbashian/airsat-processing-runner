@@ -285,15 +285,24 @@ def normalize_tiff_download(downloaded: Path, target: Path) -> None:
         downloaded.replace(target)
 
 
-def font(size: int) -> ImageFont.ImageFont:
+def font(size: int, bold: bool = False) -> ImageFont.ImageFont:
+    """Use the Persian Vazir typeface installed by the GitHub workflow."""
+    font_dir = Path(os.getenv("AIRSAT_FONT_DIR", "/usr/local/share/fonts/airsat"))
+    preferred = font_dir / ("Vazir-Bold.ttf" if bold else "Vazir-Regular.ttf")
+
     candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        preferred,
+        font_dir / "Vazir-Regular.ttf",
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"),
     ]
     for candidate in candidates:
-        if Path(candidate).exists():
-            return ImageFont.truetype(candidate, size=size)
-    return ImageFont.load_default()
+        if candidate.exists():
+            return ImageFont.truetype(str(candidate), size=size)
+
+    raise RuntimeError(
+        "Vazir font was not installed. Check the Install Vazir font workflow step."
+    )
 
 
 
@@ -589,7 +598,7 @@ def draw_timeseries_chart(
     draw.text((88, footer_top + 112), f"Linear trend: y = {slope:.3e}x + {intercept:.3e}  |  R² = {r2:.3f}", fill="#334b63", font=font(18))
 
     info_right_x = width - 570
-    draw.text((info_right_x, footer_top + 30), display_text(f"Pollutant: {row['pollutant']}   |   Province: {row.get('province_name') or 'Iran'}"), fill="#1f3850", font=font(22))
+    draw.text((info_right_x, footer_top + 30), display_text(f"Pollutant: {row['pollutant']}   |   Province: {row.get('province_name') or 'Iran'}"), fill="#1f3850", font=font(22, bold=True))
     draw.text((info_right_x, footer_top + 78), display_text(f"Unit: {cfg['unit']}   |   Latest month: {latest['period']}"), fill="#35516d", font=font(18))
     draw.text((info_right_x, footer_top + 114), display_text(f"n = {len(series)} monthly points   |   airsat.ir"), fill="#35516d", font=font(18))
 
@@ -627,13 +636,13 @@ def draw_header(draw: ImageDraw.ImageDraw, width: int, title: str, generated_at:
     brand_x = width - 280
     draw.text((72, header_top + 42), "Sentinel-5P / TROPOMI  •  Google Earth Engine  •  airsat.ir", fill="white", font=font(17))
     draw.text((72, header_top + 82), generated_at, fill="#d9ecff", font=font(15))
-    draw.text((brand_x + 54, header_top + 24), "AirSat", fill="white", font=font(38))
+    draw.text((brand_x + 54, header_top + 24), "AirSat", fill="white", font=font(38, bold=True))
     draw.text((brand_x + 56, header_top + 74), "Satellite-powered air monitoring for Iran", fill="#d9ecff", font=font(12))
     # Title kept clearly away from the brand area.
     title_text = display_text(title)
-    title_w = draw.textlength(title_text, font=font(24))
+    title_w = draw.textlength(title_text, font=font(24, bold=True))
     title_x = max(420, brand_x - title_w - 28)
-    draw.text((title_x, header_top + 68), title_text, fill="white", font=font(24))
+    draw.text((title_x, header_top + 68), title_text, fill="white", font=font(24, bold=True))
 
 
 def compute_linear_trend(values: list[float]) -> tuple[float, float, float]:
@@ -703,7 +712,7 @@ def compose_preview(
         display_text("Preview map packed with GeoTIFF export"),
     ]
     for idx, line in enumerate(left_lines):
-        draw.text((92, footer_top + 28 + idx * 38), line, fill="#28435d", font=font(20 if idx == 0 else 18))
+        draw.text((92, footer_top + 28 + idx * 38), line, fill="#28435d", font=font(20, bold=True) if idx == 0 else font(18))
     for idx, line in enumerate(right_lines):
         draw.text((900, footer_top + 28 + idx * 38), line, fill="#526b83", font=font(17))
 
