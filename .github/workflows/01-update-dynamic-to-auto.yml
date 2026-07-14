@@ -1,14 +1,25 @@
-name: 01 - Update Dynamic Layers to airsat-auto
+name: 01 - Build One Dynamic Layer to airsat-auto
 
 on:
   workflow_dispatch:
     inputs:
-      pollutants:
-        description: "ابتدا فقط یک آلاینده را اجرا کن"
+      pollutant:
+        description: "آلاینده"
         required: true
         default: NO2
         type: choice
-        options: [NO2, SO2, CO, O3, HCHO, AER_AI, CH4, all]
+        options: [NO2, SO2, CO, O3, HCHO, AER_AI, CH4]
+      period:
+        description: "فقط یک دوره پویا در هر اجرا"
+        required: true
+        default: latest_7d
+        type: choice
+        options: [latest_7d, latest_30d, latest_90d, latest_month, current_year]
+      force_rebuild:
+        description: "اگر خروجی سالم وجود دارد دوباره ساخته شود؟"
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -18,12 +29,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  update:
+  build-one-dynamic:
     runs-on: ubuntu-latest
     timeout-minutes: 300
     env:
       AIRSAT_REPOSITORY_ROOT: ${{ github.workspace }}/target
-      SELECTED_POLLUTANTS: ${{ inputs.pollutants }}
+      SELECTED_POLLUTANT: ${{ inputs.pollutant }}
+      SELECTED_PERIOD: ${{ inputs.period }}
+      COMMIT_MESSAGE: "dynamic: ${{ inputs.pollutant }} ${{ inputs.period }}"
     steps:
       - name: Checkout public runner files
         uses: actions/checkout@v4
@@ -51,9 +64,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r runner/requirements-actions.txt
 
-      - name: Build rolling layers directly inside airsat-auto
+      - name: Build one dynamic layer
         env:
           AIRSAT_BUILD_MODE: daily
+          AIRSAT_PERIOD_KEYS: ${{ inputs.period }}
+          AIRSAT_SKIP_EXISTING: ${{ inputs.force_rebuild == false }}
           AIRSAT_START_YEAR: "2018"
           AIRSAT_THUMB_DIMENSIONS: "1200"
           AIRSAT_STATS_SCALE: "7000"
@@ -64,21 +79,21 @@ jobs:
           AIRSAT_VISUAL_GAP_FILL: "true"
           AIRSAT_VISUAL_GAP_FILL_RADII_KM: "10,30,75"
           AIRSAT_VISUAL_FINAL_MEAN_FILL: "true"
-          AIRSAT_POLLUTANTS: ${{ inputs.pollutants }}
+          AIRSAT_POLLUTANTS: ${{ inputs.pollutant }}
           EE_SERVICE_ACCOUNT_JSON: ${{ secrets.EE_SERVICE_ACCOUNT_JSON }}
           EE_PROJECT: ${{ secrets.EE_PROJECT }}
           EE_PROVINCES_ASSET: ${{ secrets.EE_PROVINCES_ASSET }}
           EE_PROVINCE_NAME_FIELD: ${{ secrets.EE_PROVINCE_NAME_FIELD }}
         run: python runner/scripts/build_airsat_static.py
 
-      - name: Validate dynamic outputs
+      - name: Validate selected dynamic layer
         run: >-
           python runner/scripts/validate_airsat_outputs.py
-          --pollutants "${SELECTED_POLLUTANTS}"
-          --groups dynamic
+          --pollutants "${SELECTED_POLLUTANT}"
+          --periods "${SELECTED_PERIOD}"
           --require-stats
 
-      - name: Commit outputs to private airsat-auto
+      - name: Commit completed output immediately
         working-directory: target
         run: |
           set -euo pipefail
@@ -88,7 +103,8 @@ jobs:
           if git diff --staged --quiet; then
             echo "No generated changes"
           else
-            git commit -m "auto: update ${SELECTED_POLLUTANTS} dynamic layers"
+            git commit -m "${COMMIT_MESSAGE}"
             git pull --rebase origin main
             git push origin HEAD:main
           fi
+

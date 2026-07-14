@@ -1,14 +1,20 @@
-name: 03 - Rebuild Time Series to airsat-auto
+name: 03 - Build One Time-Series Year to airsat-auto
 
 on:
   workflow_dispatch:
     inputs:
-      pollutants:
-        description: "هر بار فقط یک آلاینده"
+      pollutant:
+        description: "آلاینده"
         required: true
         default: NO2
         type: choice
         options: [NO2, SO2, CO, O3, HCHO, AER_AI, CH4]
+      year:
+        description: "یک سال از سری زمانی در هر اجرا"
+        required: true
+        default: "2018"
+        type: choice
+        options: ["2018", "2019", "2020", "2021", "2022", "2023", "2024", "2025", "2026"]
 
 permissions:
   contents: read
@@ -18,17 +24,19 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  timeseries:
+  build-one-timeseries-year:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 300
     env:
       AIRSAT_REPOSITORY_ROOT: ${{ github.workspace }}/target
-      SELECTED_POLLUTANTS: ${{ inputs.pollutants }}
+      SELECTED_POLLUTANT: ${{ inputs.pollutant }}
+      COMMIT_MESSAGE: "timeseries: ${{ inputs.pollutant }} year ${{ inputs.year }}"
     steps:
       - name: Checkout public runner files
         uses: actions/checkout@v4
         with:
           path: runner
+
       - name: Checkout private airsat-auto repository
         uses: actions/checkout@v4
         with:
@@ -37,48 +45,55 @@ jobs:
           token: ${{ secrets.AIRSAT_AUTO_PAT }}
           fetch-depth: 0
           path: target
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: runner/requirements-actions.txt
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r runner/requirements-actions.txt
-      - name: Build monthly provincial time series
+
+      - name: Build and merge one time-series year
         env:
           AIRSAT_BUILD_MODE: timeseries
+          AIRSAT_TIMESERIES_YEAR: ${{ inputs.year }}
           AIRSAT_START_YEAR: "2018"
           AIRSAT_STATS_SCALE: "7000"
           AIRSAT_STATS_CRS: "EPSG:4326"
           AIRSAT_BOUNDARY_SIMPLIFY_M: "100"
           AIRSAT_EXPECTED_PROVINCE_COUNT: "31"
-          AIRSAT_POLLUTANTS: ${{ inputs.pollutants }}
+          AIRSAT_POLLUTANTS: ${{ inputs.pollutant }}
           EE_SERVICE_ACCOUNT_JSON: ${{ secrets.EE_SERVICE_ACCOUNT_JSON }}
           EE_PROJECT: ${{ secrets.EE_PROJECT }}
           EE_PROVINCES_ASSET: ${{ secrets.EE_PROVINCES_ASSET }}
           EE_PROVINCE_NAME_FIELD: ${{ secrets.EE_PROVINCE_NAME_FIELD }}
         run: python runner/scripts/build_airsat_static.py
-      - name: Validate time series
+
+      - name: Validate merged time-series file
         run: >-
           python runner/scripts/validate_airsat_outputs.py
-          --pollutants "${SELECTED_POLLUTANTS}"
+          --pollutants "${SELECTED_POLLUTANT}"
           --require-timeseries
           --skip-layers
-          --min-series-points 12
-      - name: Commit outputs to private airsat-auto
+          --min-series-points 1
+
+      - name: Commit completed output immediately
         working-directory: target
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add public/data/timeseries public/data/catalog/provinces.json public/data/boundaries/provinces.geojson public/data/catalog/pollutants.json public/data/catalog/layers.json
+          git add public/data public/visual_real
           if git diff --staged --quiet; then
             echo "No generated changes"
           else
-            git commit -m "timeseries: rebuild ${SELECTED_POLLUTANTS} monthly provincial data"
+            git commit -m "${COMMIT_MESSAGE}"
             git pull --rebase origin main
             git push origin HEAD:main
           fi
+
