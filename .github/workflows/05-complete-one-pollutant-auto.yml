@@ -32,9 +32,9 @@ on:
         type: boolean
 
   # Daily self-healing and freshness refresh.
-  # Minute 17 avoids the common top-of-hour scheduling peak.
+  # Minute 30 avoids the common top-of-hour scheduling peak.
   schedule:
-    - cron: "17 2 * * *"
+    - cron: "30 20 * * *"
 
 permissions:
   contents: read
