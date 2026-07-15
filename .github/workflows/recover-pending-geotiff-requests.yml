@@ -1,27 +1,19 @@
-name: Process AirSat GeoTIFF Request
+name: Recover Pending AirSat Requests
 
 on:
+  schedule:
+    - cron: "*/30 * * * *"
   workflow_dispatch:
-    inputs:
-      request_id:
-        description: Supabase download_requests UUID
-        required: true
-        type: string
-      force_rebuild:
-        description: Rebuild and overwrite an already-ready request
-        required: true
-        default: false
-        type: boolean
 
 permissions:
   contents: read
 
 concurrency:
-  group: airsat-geotiff-${{ inputs.request_id }}
+  group: airsat-geotiff-pending-recovery
   cancel-in-progress: false
 
 jobs:
-  process:
+  recover:
     runs-on: ubuntu-latest
     timeout-minutes: 330
 
@@ -43,31 +35,27 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Persian Vazir font and Python dependencies
+      - name: Install Persian Vazir font and dependencies
         run: |
           set -euo pipefail
-
           sudo mkdir -p /usr/local/share/fonts/airsat
-
-          sudo curl --fail --location --retry 3             "https://cdn.jsdelivr.net/gh/rastikerdar/vazir-font@v30.1.0/dist/Vazir-Regular.ttf"             --output /usr/local/share/fonts/airsat/Vazir-Regular.ttf
-
-          sudo curl --fail --location --retry 3             "https://cdn.jsdelivr.net/gh/rastikerdar/vazir-font@v30.1.0/dist/Vazir-Bold.ttf"             --output /usr/local/share/fonts/airsat/Vazir-Bold.ttf
-
-          sudo fc-cache -f -v
-
-          test -s /usr/local/share/fonts/airsat/Vazir-Regular.ttf
-          test -s /usr/local/share/fonts/airsat/Vazir-Bold.ttf
-
+          sudo curl --fail --location --retry 3 \
+            "https://cdn.jsdelivr.net/gh/rastikerdar/vazir-font@v30.1.0/dist/Vazir-Regular.ttf" \
+            --output /usr/local/share/fonts/airsat/Vazir-Regular.ttf
+          sudo curl --fail --location --retry 3 \
+            "https://cdn.jsdelivr.net/gh/rastikerdar/vazir-font@v30.1.0/dist/Vazir-Bold.ttf" \
+            --output /usr/local/share/fonts/airsat/Vazir-Bold.ttf
+          sudo fc-cache -f
           python -m pip install --upgrade pip
           python -m pip install earthengine-api requests pillow arabic-reshaper python-bidi
 
-      - name: Process AirSat request
+      - name: Recover stale pending requests
         env:
-          REQUEST_ID: ${{ inputs.request_id }}
-          FORCE_REBUILD_REQUEST: ${{ inputs.force_rebuild }}
           AIRSAT_AUTO_ROOT: ${{ github.workspace }}/target
           AIRSAT_FONT_DIR: /usr/local/share/fonts/airsat
           AIRSAT_TIMESERIES_FALLBACK: "true"
+          PENDING_MIN_AGE_MINUTES: "10"
+          MAX_PENDING_REQUESTS: "2"
           EE_SERVICE_ACCOUNT_JSON: ${{ secrets.EE_SERVICE_ACCOUNT_JSON }}
           EE_PROJECT: ${{ secrets.EE_PROJECT }}
           EE_PROVINCES_ASSET: ${{ secrets.EE_PROVINCES_ASSET }}
@@ -75,4 +63,4 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           EXPORT_BUCKET: airsat-exports
-        run: python scripts/process_geotiff_request.py
+        run: python scripts/process_pending_requests.py
