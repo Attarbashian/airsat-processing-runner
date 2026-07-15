@@ -116,10 +116,22 @@ def validate_stats(layer: dict[str, Any], expected: int) -> list[str]:
     return errors
 
 
-def validate_layer(layer: dict[str, Any], expected: int, require_stats: bool) -> list[str]:
+def validate_layer(
+    layer: dict[str, Any],
+    expected: int,
+    require_stats: bool,
+    require_available: bool,
+) -> list[str]:
     errors: list[str] = []
     lid = str(layer.get("id", "unknown"))
     if not layer.get("available"):
+        if require_available:
+            reason = (
+                layer.get("skip_reason")
+                or (layer.get("validation") or {}).get("reason")
+                or "unknown"
+            )
+            return [f"{lid}: selected layer is unavailable; reason={reason}"]
         return errors
     visual_path = layer.get("visual_path")
     georef_path = layer.get("georef_path")
@@ -166,7 +178,12 @@ def validate_layer(layer: dict[str, Any], expected: int, require_stats: bool) ->
     return errors
 
 
-def validate_timeseries(pollutant: str, expected: int, min_points: int) -> list[str]:
+def validate_timeseries(
+    pollutant: str,
+    expected: int,
+    min_points: int,
+    required_periods: set[str] | None,
+) -> list[str]:
     path = TIMESERIES / f"{pollutant}.json"
     if not path.exists():
         return [f"{pollutant}: time-series file missing: {path.relative_to(ROOT)}"]
@@ -182,15 +199,46 @@ def validate_timeseries(pollutant: str, expected: int, min_points: int) -> list[
     if len({x for x in names if x}) < expected:
         errors.append(f"{pollutant}: time-series province names are missing or duplicated")
     short = []
+    missing_required = []
+    duplicates = []
+
     for province in provinces:
-        numeric = [x for x in (province.get("series") or []) if finite(x.get("value"))]
+        numeric = [
+            point
+            for point in (province.get("series") or [])
+            if finite(point.get("value"))
+        ]
+        province_name = province.get("name_fa") or province.get("id")
         if len(numeric) < min_points:
-            short.append(f"{province.get('name_fa') or province.get('id')}={len(numeric)}")
+            short.append(f"{province_name}={len(numeric)}")
+
+        periods = [str(point.get("period") or "") for point in numeric]
+        if len(periods) != len(set(periods)):
+            duplicates.append(str(province_name))
+
+        if required_periods is not None:
+            missing = sorted(required_periods - set(periods))
+            if missing:
+                missing_required.append(
+                    f"{province_name}:{','.join(missing)}"
+                )
+
     if short:
         errors.append(
             f"{pollutant}: provinces with fewer than {min_points} numeric monthly points: "
             + ", ".join(short[:10])
             + (" ..." if len(short) > 10 else "")
+        )
+    if duplicates:
+        errors.append(
+            f"{pollutant}: duplicate monthly periods in provinces: "
+            + ", ".join(duplicates[:10])
+        )
+    if missing_required:
+        errors.append(
+            f"{pollutant}: selected monthly periods are missing: "
+            + " | ".join(missing_required[:10])
+            + (" ..." if len(missing_required) > 10 else "")
         )
     return errors
 
@@ -201,9 +249,11 @@ def main() -> int:
     parser.add_argument("--groups", default="all", help="dynamic,annual,range or all")
     parser.add_argument("--periods", default="all", help="Comma-separated period keys")
     parser.add_argument("--require-stats", action="store_true")
+    parser.add_argument("--require-available", action="store_true")
     parser.add_argument("--require-timeseries", action="store_true")
     parser.add_argument("--skip-layers", action="store_true", help="Validate only time-series files")
     parser.add_argument("--min-series-points", type=int, default=12)
+    parser.add_argument("--timeseries-periods", default="all")
     args = parser.parse_args()
 
     if not CATALOG.exists():
@@ -212,6 +262,7 @@ def main() -> int:
     selected = parse_pollutants(args.pollutants)
     groups = parse_groups(args.groups)
     periods = parse_periods(args.periods)
+    required_timeseries_periods = parse_periods(args.timeseries_periods)
     layers = read_json(CATALOG).get("layers", [])
     if selected is not None:
         layers = [l for l in layers if str(l.get("pollutant", "")).upper() in selected]
@@ -224,8 +275,23 @@ def main() -> int:
     errors: list[str] = []
     count = 0
     if not args.skip_layers:
+        if periods is not None:
+            found_periods = {
+                str(layer.get("period_key", ""))
+                for layer in layers
+            }
+            for missing_period in sorted(periods - found_periods):
+                errors.append(
+                    f"catalog: selected period is missing: {missing_period}"
+                )
+
         for layer in layers:
-            errs = validate_layer(layer, expected, args.require_stats)
+            errs = validate_layer(
+                layer,
+                expected,
+                args.require_stats,
+                args.require_available,
+            )
             errors.extend(errs)
             if layer.get("available") and not errs:
                 count += 1
@@ -235,7 +301,14 @@ def main() -> int:
             str(l.get("pollutant", "")).upper() for l in layers if l.get("pollutant")
         }
         for pollutant in sorted(pollutants):
-            errors.extend(validate_timeseries(pollutant, expected, args.min_series_points))
+            errors.extend(
+                validate_timeseries(
+                    pollutant,
+                    expected,
+                    args.min_series_points,
+                    required_timeseries_periods,
+                )
+            )
 
     if errors:
         print("VALIDATION FAILED")

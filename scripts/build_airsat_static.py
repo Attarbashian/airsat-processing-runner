@@ -15,7 +15,7 @@ from PIL import Image
 from rasterio.io import MemoryFile
 from rasterio.warp import transform_bounds
 
-PIPELINE_VERSION = "airsat-pipeline-v6.7-segmented-georef-stats-gapfill"
+PIPELINE_VERSION = "airsat-pipeline-v7.0-reliable-atomic-self-healing"
 ROOT = Path(os.environ.get("AIRSAT_REPOSITORY_ROOT", str(Path(__file__).resolve().parents[1]))).expanduser().resolve()
 PUBLIC = ROOT / "public"
 DATA = PUBLIC / "data"
@@ -35,7 +35,18 @@ STATS_CRS = os.getenv("AIRSAT_STATS_CRS", "EPSG:4326").strip()
 WEB_CRS = os.getenv("AIRSAT_WEB_CRS", "EPSG:3857").strip()
 DOWNLOAD_TIMEOUT = int(os.getenv("AIRSAT_DOWNLOAD_TIMEOUT", "900"))
 BOUNDARY_SIMPLIFY_M = float(os.getenv("AIRSAT_BOUNDARY_SIMPLIFY_M", "100"))
-MAX_DOWNLOAD_ATTEMPTS = int(os.getenv("AIRSAT_MAX_DOWNLOAD_ATTEMPTS", "3"))
+MAX_DOWNLOAD_ATTEMPTS = int(os.getenv("AIRSAT_MAX_DOWNLOAD_ATTEMPTS", "1"))
+VISUAL_EXPORT_DIMENSIONS = [
+    int(item.strip())
+    for item in os.getenv(
+        "AIRSAT_VISUAL_EXPORT_DIMENSIONS",
+        f"{THUMB_DIMENSIONS},1000,800",
+    ).split(",")
+    if item.strip()
+]
+VISUAL_EXPORT_DIMENSIONS = list(dict.fromkeys(
+    dimension for dimension in VISUAL_EXPORT_DIMENSIONS if dimension >= 500
+))
 VISUAL_GAP_FILL = os.getenv("AIRSAT_VISUAL_GAP_FILL", "true").strip().lower() not in {"0", "false", "no", "off"}
 VISUAL_GAP_FILL_RADII_KM = [
     float(x) for x in os.getenv("AIRSAT_VISUAL_GAP_FILL_RADII_KM", "10,30,75").split(",")
@@ -52,6 +63,11 @@ ONLY_PERIOD_KEYS = {
 }
 TIMESERIES_YEAR_RAW = os.getenv("AIRSAT_TIMESERIES_YEAR", "").strip()
 TIMESERIES_YEAR = int(TIMESERIES_YEAR_RAW) if TIMESERIES_YEAR_RAW else None
+TIMESERIES_MONTHS = {
+    int(item.strip())
+    for item in os.getenv("AIRSAT_TIMESERIES_MONTHS", "").split(",")
+    if item.strip()
+}
 SKIP_EXISTING = os.getenv("AIRSAT_SKIP_EXISTING", "true").strip().lower() in {
     "1", "true", "yes", "on"
 }
@@ -62,6 +78,7 @@ POLLUTANTS: dict[str, dict[str, Any]] = {
     # Gap filling below is applied only to the public visual image; statistics
     # and downloadable scientific rasters continue to use the original mask.
     "NO2": {
+        "dataset_start":"2018-06-28",
         "label":"NO₂", "name_fa":"دی‌اکسید نیتروژن", "name_en":"Nitrogen dioxide",
         "collection":"COPERNICUS/S5P/OFFL/L3_NO2",
         "band":"tropospheric_NO2_column_number_density",
@@ -73,6 +90,7 @@ POLLUTANTS: dict[str, dict[str, Any]] = {
         "vmin":0.0, "vmax":0.0002
     },
     "SO2": {
+        "dataset_start":"2018-12-05",
         "label":"SO₂", "name_fa":"دی‌اکسید گوگرد", "name_en":"Sulfur dioxide",
         "collection":"COPERNICUS/S5P/OFFL/L3_SO2",
         "band":"SO2_column_number_density",
@@ -84,6 +102,7 @@ POLLUTANTS: dict[str, dict[str, Any]] = {
         "vmin":0.0, "vmax":0.0005
     },
     "CO": {
+        "dataset_start":"2018-06-28",
         "label":"CO", "name_fa":"مونوکسید کربن", "name_en":"Carbon monoxide",
         "collection":"COPERNICUS/S5P/OFFL/L3_CO",
         "band":"CO_column_number_density",
@@ -95,6 +114,7 @@ POLLUTANTS: dict[str, dict[str, Any]] = {
         "vmin":0.0, "vmax":0.05
     },
     "O3": {
+        "dataset_start":"2018-09-08",
         "label":"O₃", "name_fa":"ازن", "name_en":"Ozone",
         "collection":"COPERNICUS/S5P/OFFL/L3_O3",
         "band":"O3_column_number_density",
@@ -106,6 +126,7 @@ POLLUTANTS: dict[str, dict[str, Any]] = {
         "vmin":0.12, "vmax":0.15
     },
     "HCHO": {
+        "dataset_start":"2018-12-05",
         "label":"HCHO", "name_fa":"فرمالدهید", "name_en":"Formaldehyde",
         "collection":"COPERNICUS/S5P/OFFL/L3_HCHO",
         "band":"tropospheric_HCHO_column_number_density",
@@ -117,6 +138,7 @@ POLLUTANTS: dict[str, dict[str, Any]] = {
         "vmin":0.0, "vmax":0.0003
     },
     "AER_AI": {
+        "dataset_start":"2018-07-04",
         "label":"AER_AI", "name_fa":"شاخص جذب آئروسل", "name_en":"Absorbing aerosol index",
         "collection":"COPERNICUS/S5P/OFFL/L3_AER_AI",
         "band":"absorbing_aerosol_index",
@@ -128,6 +150,7 @@ POLLUTANTS: dict[str, dict[str, Any]] = {
         "vmin":-1.0, "vmax":3.0
     },
     "CH4": {
+        "dataset_start":"2019-02-08",
         "label":"CH₄", "name_fa":"متان", "name_en":"Methane",
         "collection":"COPERNICUS/S5P/OFFL/L3_CH4",
         "band":"CH4_column_volume_mixing_ratio_dry_air",
@@ -142,8 +165,14 @@ POLLUTANTS: dict[str, dict[str, Any]] = {
 NAME_FIELDS = ["name_fa","NAME_FA","نام","نام_استان","ostan","OSTAN","Province","province","NAME_1","ADM1_NAME","name","Name","NAME"]
 
 def write_json(path: Path, obj: Any) -> None:
+    """Write JSON atomically so cancelled jobs never leave truncated files."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(obj, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
 
 def read_json(path: Path, default: Any) -> Any:
     if not path.exists(): return default
@@ -164,16 +193,37 @@ def add_months(v: date, m: int) -> date:
     return v.replace(year=y, month=mo, day=1)
 def ticks(vmin: float, vmax: float, n: int = 5) -> list[float]: return [vmin+i*(vmax-vmin)/(n-1) for i in range(n)]
 
-def annual_periods():
-    out = {}; last = NOW.date().year - 1
-    for y in range(START_YEAR, last+1): out[f"annual_{y}"]={"label_fa":f"سال {y}","start":date(y,1,1),"end":date(y+1,1,1),"group":"annual","year":y}
+def dataset_start_date(cfg):
+    return date.fromisoformat(cfg["dataset_start"])
+
+def annual_periods(cfg):
+    out = {}
+    first = dataset_start_date(cfg).year
+    last = NOW.date().year - 1
+    for y in range(max(START_YEAR, first), last + 1):
+        out[f"annual_{y}"] = {
+            "label_fa": f"سال {y}",
+            "start": date(y, 1, 1),
+            "end": date(y + 1, 1, 1),
+            "group": "annual",
+            "year": y,
+        }
     return out
 
-def range_periods():
-    out = {}; last = NOW.date().year - 1
-    for y1 in range(START_YEAR, last+1):
-        for y2 in range(y1+1, last+1):
-            out[f"range_{y1}_{y2}"]={"label_fa":f"چندساله {y1} تا {y2}","start":date(y1,1,1),"end":date(y2+1,1,1),"group":"range","start_year":y1,"end_year":y2}
+def range_periods(cfg):
+    out = {}
+    first = dataset_start_date(cfg).year
+    last = NOW.date().year - 1
+    for y1 in range(max(START_YEAR, first), last + 1):
+        for y2 in range(y1 + 1, last + 1):
+            out[f"range_{y1}_{y2}"] = {
+                "label_fa": f"چندساله {y1} تا {y2}",
+                "start": date(y1, 1, 1),
+                "end": date(y2 + 1, 1, 1),
+                "group": "range",
+                "start_year": y1,
+                "end_year": y2,
+            }
     return out
 
 def dynamic_periods(latest: date):
@@ -186,12 +236,26 @@ def dynamic_periods(latest: date):
         "current_year":{"label_fa":"سال جاری","start":date(latest.year,1,1),"end":end,"group":"dynamic","data_latest_date":latest},
     }
 
-def monthly_periods_from_start():
-    out=[]; cur=date(START_YEAR,1,1); stop=NOW.date().replace(day=1)
-    while cur<stop:
-        if TIMESERIES_YEAR is None or cur.year == TIMESERIES_YEAR:
-            out.append((cur.strftime("%Y-%m"),cur,add_months(cur,1)))
-        cur=add_months(cur,1)
+def monthly_periods_from_start(cfg):
+    start = dataset_start_date(cfg).replace(day=1)
+    current = max(date(START_YEAR, 1, 1), start)
+    stop = NOW.date().replace(day=1)
+    out = []
+
+    while current < stop:
+        if (
+            (TIMESERIES_YEAR is None or current.year == TIMESERIES_YEAR)
+            and (not TIMESERIES_MONTHS or current.month in TIMESERIES_MONTHS)
+        ):
+            out.append(
+                (
+                    current.strftime("%Y-%m"),
+                    current,
+                    add_months(current, 1),
+                )
+            )
+        current = add_months(current, 1)
+
     return out
 
 def select_periods(periods):
@@ -458,16 +522,99 @@ def build_rgba(ds):
     return np.dstack((rgb,alpha))
 
 def download_georeferenced_webp(image,cfg,country,out_path):
-    region,expected=projected_country_bbox(country); scale=max(expected[2]-expected[0],expected[3]-expected[1])/THUMB_DIMENSIONS
-    vis=image.visualize(min=float(cfg["vmin"]),max=float(cfg["vmax"]),palette=[c.replace("#","") for c in cfg["palette"]],opacity=1.0)
-    url=vis.getDownloadURL({"name":"airsat_visual","region":region,"crs":WEB_CRS,"scale":scale,"format":"GEO_TIFF","filePerBand":False})
-    tif=extract_tiff_bytes(download_bytes(url))
-    with MemoryFile(tif) as mem:
-        with mem.open() as ds:
-            meta=validate_geotiff(ds,expected); rgba=build_rgba(ds); west,south,east,north=transform_bounds(ds.crs,"EPSG:4326",ds.bounds.left,ds.bounds.bottom,ds.bounds.right,ds.bounds.top,densify_pts=21)
-    out_path.parent.mkdir(parents=True,exist_ok=True); Image.fromarray(rgba).save(out_path,"WEBP",quality=90,method=6,exact=True)
-    meta.update({"web_bounds":[[south,west],[north,east]],"requested_scale_m":scale,"webp_sha256":sha256_file(out_path),"temporary_geotiff_sha256":sha256_bytes(tif),"webp_path":f"/{out_path.relative_to(PUBLIC).as_posix()}"})
-    return meta
+    """
+    Export the visual with a new Earth Engine URL on every outer retry.
+
+    A failed signed download URL must not be retried forever. We therefore
+    regenerate the URL and progressively lower only the public preview
+    dimensions. Scientific statistics remain unchanged.
+    """
+    last_error = None
+
+    for outer_attempt, dimensions in enumerate(VISUAL_EXPORT_DIMENSIONS, 1):
+        try:
+            print(
+                f"Georeferenced visual attempt "
+                f"{outer_attempt}/{len(VISUAL_EXPORT_DIMENSIONS)} "
+                f"at {dimensions}px"
+            )
+
+            region, expected = projected_country_bbox(country)
+            scale = max(
+                expected[2] - expected[0],
+                expected[3] - expected[1],
+            ) / dimensions
+
+            vis = image.visualize(
+                min=float(cfg["vmin"]),
+                max=float(cfg["vmax"]),
+                palette=[c.replace("#","") for c in cfg["palette"]],
+                opacity=1.0,
+            )
+
+            # Generate a fresh URL for every attempt.
+            url = vis.getDownloadURL({
+                "name": f"airsat_visual_{dimensions}",
+                "region": region,
+                "crs": WEB_CRS,
+                "scale": scale,
+                "format": "GEO_TIFF",
+                "filePerBand": False,
+            })
+
+            tif = extract_tiff_bytes(download_bytes(url))
+
+            with MemoryFile(tif) as mem:
+                with mem.open() as ds:
+                    meta = validate_geotiff(ds, expected)
+                    rgba = build_rgba(ds)
+                    west, south, east, north = transform_bounds(
+                        ds.crs,
+                        "EPSG:4326",
+                        ds.bounds.left,
+                        ds.bounds.bottom,
+                        ds.bounds.right,
+                        ds.bounds.top,
+                        densify_pts=21,
+                    )
+
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_webp = out_path.with_name(out_path.name + ".tmp")
+            Image.fromarray(rgba).save(
+                temporary_webp,
+                "WEBP",
+                quality=90,
+                method=6,
+                exact=True,
+            )
+            os.replace(temporary_webp, out_path)
+
+            meta.update({
+                "web_bounds": [[south, west], [north, east]],
+                "requested_scale_m": scale,
+                "requested_dimensions": dimensions,
+                "webp_sha256": sha256_file(out_path),
+                "temporary_geotiff_sha256": sha256_bytes(tif),
+                "webp_path": f"/{out_path.relative_to(PUBLIC).as_posix()}",
+                "export_attempt": outer_attempt,
+            })
+            return meta
+
+        except Exception as error:
+            last_error = error
+            print(
+                f"Georeferenced visual attempt {outer_attempt} failed:",
+                repr(error),
+            )
+            if out_path.exists():
+                out_path.unlink()
+            if outer_attempt < len(VISUAL_EXPORT_DIMENSIONS):
+                time.sleep(20 * outer_attempt)
+
+    raise RuntimeError(
+        "All georeferenced visual export attempts failed: "
+        + repr(last_error)
+    )
 
 def clean_dir(path):
     path.mkdir(parents=True,exist_ok=True)
@@ -503,27 +650,52 @@ def build_layer(pid,cfg,key,pinfo,country,fc):
     print("Layer",pid,key,pinfo["start"],pinfo["end"])
     image,count,cmeta=composite_for_period(cfg,pinfo,country)
     if image is None or count<=0:
-        return unavailable_layer(pid,cfg,key,pinfo,cmeta.get("reason","no_images"),cmeta)
+        raise RuntimeError(
+            f"No source images for supported layer {pid} {key}: {cmeta}"
+        )
+
     summary=region_stats(image,country)
     if summary["mean"] is None:
-        return unavailable_layer(pid,cfg,key,pinfo,"no_valid_pixels_after_source_quality_filter",cmeta)
+        raise RuntimeError(
+            f"No valid pixels for supported layer {pid} {key}: {cmeta}"
+        )
 
-    visual_image,fill_meta=visual_gap_filled_image(image,country,summary["mean"])
-    rows=province_stats(image,fc,fallback_image=visual_image)
-    observed_count=sum(1 for r in rows if r.get("mean") is not None and not r.get("interpolated"))
-    interpolated_count=sum(1 for r in rows if r.get("mean") is not None and r.get("interpolated"))
+    visual_image,fill_meta=visual_gap_filled_image(
+        image,
+        country,
+        summary["mean"],
+    )
 
     out_dir=VISUAL/pid/key
     clean_dir(out_dir)
     webp=out_dir/"Iran.webp"
-    try:
-        georef=download_georeferenced_webp(visual_image,cfg,country,webp)
-    except Exception as e:
-        return unavailable_layer(pid,cfg,key,pinfo,"georeferenced_visual_failed",{**cmeta,"error":repr(e)})
+    georef=download_georeferenced_webp(
+        visual_image,
+        cfg,
+        country,
+        webp,
+    )
     write_json(out_dir/"georef.json",{
-        **georef,"pollutant":pid,"period_key":key,
-        "visual_gap_fill":fill_meta,"pipeline_version":PIPELINE_VERSION
+        **georef,
+        "pollutant":pid,
+        "period_key":key,
+        "visual_gap_fill":fill_meta,
+        "pipeline_version":PIPELINE_VERSION,
     })
+
+    # Provincial reductions run only after the visual export has succeeded.
+    rows=province_stats(image,fc,fallback_image=visual_image)
+    observed_count=sum(
+        1
+        for row in rows
+        if row.get("mean") is not None and not row.get("interpolated")
+    )
+    interpolated_count=sum(
+        1
+        for row in rows
+        if row.get("mean") is not None and row.get("interpolated")
+    )
+
     latest=pinfo.get("data_latest_date")
     layer={
         "id":f"{pid}_{key}","pollutant":pid,"label":cfg["label"],
@@ -559,7 +731,7 @@ def build_layer(pid,cfg,key,pinfo,country,fc):
     return layer
 
 def build_ts(pid,cfg,fc,country,province_catalog):
-    periods = monthly_periods_from_start()
+    periods = monthly_periods_from_start(cfg)
     if not periods:
         raise RuntimeError(
             f"No completed monthly periods are available for TIMESERIES_YEAR={TIMESERIES_YEAR}"
@@ -613,7 +785,10 @@ def build_ts(pid,cfg,fc,country,province_catalog):
         "qa_band":cfg.get("qa_band"),"qa_threshold":cfg.get("qa_threshold"),
         "qa_applied_by":cfg.get("qa_applied_by"),"qa_note":cfg.get("qa_note"),
         "qa_applied_in_pipeline":False,"stats_crs":STATS_CRS,"stats_scale":STATS_SCALE,
-        "stats_schema_version":2,"pipeline_version":PIPELINE_VERSION,"provinces":provinces
+        "stats_schema_version":2,"pipeline_version":PIPELINE_VERSION,
+        "dataset_start":cfg["dataset_start"],
+        "generated_at_utc":NOW.isoformat().replace("+00:00","Z"),
+        "provinces":provinces
     })
 
 def write_pollutants():
@@ -626,6 +801,7 @@ def write_pollutants():
             "qa_band":v.get("qa_band"),"qa_threshold":v.get("qa_threshold"),
             "qa_applied_by":v.get("qa_applied_by"),"qa_note":v.get("qa_note"),
             "qa_applied_in_pipeline":False,"collection":v["collection"],"band":v["band"],
+            "dataset_start":v["dataset_start"],
             "visual_gap_fill_default":VISUAL_GAP_FILL
         } for k,v in POLLUTANTS.items()]
     })
@@ -644,7 +820,10 @@ def main():
     print("VISUAL_GAP_FILL:",VISUAL_GAP_FILL, VISUAL_GAP_FILL_RADII_KM)
     print("ONLY_PERIOD_KEYS:", sorted(ONLY_PERIOD_KEYS))
     print("TIMESERIES_YEAR:", TIMESERIES_YEAR)
+    print("TIMESERIES_MONTHS:", sorted(TIMESERIES_MONTHS))
     print("SKIP_EXISTING:", SKIP_EXISTING)
+    print("VISUAL_EXPORT_DIMENSIONS:", VISUAL_EXPORT_DIMENSIONS)
+    print("DOWNLOAD_TIMEOUT:", DOWNLOAD_TIMEOUT)
     ee_init()
     asset=os.getenv("EE_PROVINCES_ASSET")
     if not asset:
@@ -683,7 +862,7 @@ def main():
             build_ts(pid,cfg,fc,country,province_catalog)
             continue
         if BUILD_MODE=="ranges":
-            periods=range_periods()
+            periods=range_periods(cfg)
         else:
             latest=latest_available_date(cfg,country)
             if BUILD_MODE=="daily":
@@ -691,7 +870,7 @@ def main():
                     continue
                 periods=dynamic_periods(latest)
             else:
-                periods=annual_periods()
+                periods=annual_periods(cfg)
                 if latest is not None and not ONLY_PERIOD_KEYS:
                     periods.update(dynamic_periods(latest))
         periods = select_periods(periods)
