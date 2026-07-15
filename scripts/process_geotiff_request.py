@@ -241,9 +241,11 @@ def apply_qa_if_available(image: ee.Image, threshold: float | None) -> ee.Image:
 
 def build_region(row: dict[str, Any]) -> ee.Geometry:
     provinces = ee.FeatureCollection(required("EE_PROVINCES_ASSET"))
-    province_name = row.get("province_name")
+    province_name = str(row.get("province_name") or "").strip()
     if not province_name:
-        return provinces.geometry()
+        raise RuntimeError(
+            "Province selection is required; nationwide GeoTIFF export is disabled."
+        )
 
     fields = [
         os.getenv("EE_PROVINCE_NAME_FIELD", "Ostan"),
@@ -328,6 +330,34 @@ def normalize_name(value: Any) -> str:
         text = text.replace(old, new)
     return text
 
+
+
+COUNTRY_LEVEL_REGION_NAMES = {
+    "iran",
+    "islamic republic of iran",
+    "ایران",
+    "کل ایران",
+    "سراسر ایران",
+    "all",
+    "country",
+    "national",
+}
+
+
+def validate_province_only_request(row: dict[str, Any]) -> None:
+    """Defense in depth: processor must never export the whole country."""
+    province_name = normalize_name(row.get("province_name"))
+    roi_type = str(row.get("roi_type") or "").strip().lower()
+
+    if (
+        roi_type != "province"
+        or not province_name
+        or province_name in COUNTRY_LEVEL_REGION_NAMES
+    ):
+        raise RuntimeError(
+            "GeoTIFF export is restricted to one selected province. "
+            "Nationwide export is not permitted."
+        )
 
 def load_precomputed_timeseries(row: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
     """Load province time series already generated in the private airsat-auto repo."""
@@ -511,7 +541,7 @@ def draw_timeseries_chart(
 
     draw.rounded_rectangle((34, 30, width - 34, height - 34), radius=30, fill="#eef3f8")
     generated = datetime.now().strftime("%Y-%m-%d, %H:%M UTC")
-    title = f"Monthly time series of {row['pollutant']} in {row.get('province_name') or 'Iran'}"
+    title = f"Monthly time series of {row['pollutant']} in {row.get('province_name')}"
     draw_header(draw, width, title, generated)
 
     body = (64, 200, width - 64, 870)
@@ -598,7 +628,7 @@ def draw_timeseries_chart(
     draw.text((88, footer_top + 112), f"Linear trend: y = {slope:.3e}x + {intercept:.3e}  |  R² = {r2:.3f}", fill="#334b63", font=font(18))
 
     info_right_x = width - 570
-    draw.text((info_right_x, footer_top + 30), display_text(f"Pollutant: {row['pollutant']}   |   Province: {row.get('province_name') or 'Iran'}"), fill="#1f3850", font=font(22, bold=True))
+    draw.text((info_right_x, footer_top + 30), display_text(f"Pollutant: {row['pollutant']}   |   Province: {row.get('province_name')}"), fill="#1f3850", font=font(22, bold=True))
     draw.text((info_right_x, footer_top + 78), display_text(f"Unit: {cfg['unit']}   |   Latest month: {latest['period']}"), fill="#35516d", font=font(18))
     draw.text((info_right_x, footer_top + 114), display_text(f"n = {len(series)} monthly points   |   airsat.ir"), fill="#35516d", font=font(18))
 
@@ -675,7 +705,7 @@ def compose_preview(
 
     draw.rounded_rectangle((34, 30, width - 34, height - 34), radius=30, fill="#eef3f8")
     generated = datetime.now().strftime("%Y-%m-%d, %H:%M UTC")
-    title = f"Spatial map of {row['pollutant']} in {row.get('province_name') or 'Iran'}"
+    title = f"Spatial map of {row['pollutant']} in {row.get('province_name')}"
     draw_header(draw, width, title, generated)
 
     body = (64, 200, width - 64, 840)
@@ -700,7 +730,7 @@ def compose_preview(
 
     footer_top = 865
     draw.rounded_rectangle((64, footer_top, width - 64, height - 70), radius=20, fill="#dde7f0", outline="#c2d0de", width=1)
-    region = row.get('province_name') or 'Iran'
+    region = row.get('province_name')
     left_lines = [
         display_text(f"Pollutant: {row['pollutant']}   |   Region: {region}"),
         display_text(f"Period: {row.get('period_key') or (start + ' to ' + end)}   |   Unit: {cfg['unit']}"),
@@ -753,6 +783,19 @@ def main() -> None:
     if row["status"] in {"cancelled", "expired"}:
         print(f"Request status is {row['status']}; nothing to do.")
         return
+
+    try:
+        validate_province_only_request(row)
+    except Exception as error:
+        update_request(
+            request_id,
+            {
+                "status": "failed",
+                "error": str(error),
+                "message": "درخواست رد شد؛ دریافت GeoTIFF فقط برای یک استان مجاز است.",
+            },
+        )
+        raise
 
     update_request(
         request_id,
@@ -864,7 +907,7 @@ def main() -> None:
                         f"Period key: {row.get('period_key') or 'custom'}",
                         f"Start date: {start}",
                         f"End date: {end}",
-                        f"Region: {row.get('province_name') or 'Iran'}",
+                        f"Region: {row.get('province_name')}",
                         f"Unit: {cfg['unit']}",
                         f"Sentinel-5P image count: {count}",
                         f"Province time-series points: {len(series)}",
