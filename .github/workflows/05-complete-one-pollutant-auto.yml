@@ -1,28 +1,47 @@
-name: 05 - Complete One Pollutant Automatically
+name: 05 - AirSat Data Orchestrator
 
 on:
   workflow_dispatch:
     inputs:
       pollutant:
-        description: "آلاینده"
+        description: "ALL = کل سایت؛ یا فقط یک آلاینده"
         required: true
-        default: NO2
+        default: ALL
         type: choice
-        options: [NO2, SO2, CO, O3, HCHO, AER_AI, CH4]
+        options:
+          - ALL
+          - NO2
+          - SO2
+          - CO
+          - O3
+          - HCHO
+          - AER_AI
+          - CH4
       scope:
-        description: "core = پویا، سالانه و سری زمانی | complete = همه موارد به‌همراه بازه‌های چندساله"
+        description: "core = داده‌های اصلی سایت؛ complete = همراه بازه‌های چندساله برای یک آلاینده"
         required: true
         default: core
         type: choice
-        options: [core, complete]
+        options:
+          - core
+          - complete
       force_rebuild:
-        description: "خروجی‌های سالم موجود هم دوباره ساخته شوند؟"
+        description: "همه خروجی‌های سالم نیز دوباره ساخته شوند؟"
         required: true
         default: false
         type: boolean
 
+  # Daily self-healing and freshness refresh.
+  # Minute 17 avoids the common top-of-hour scheduling peak.
+  schedule:
+    - cron: "17 2 * * *"
+
 permissions:
   contents: read
+
+concurrency:
+  group: airsat-public-data-orchestrator
+  cancel-in-progress: false
 
 jobs:
   prepare:
@@ -31,14 +50,16 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       has_tasks: ${{ steps.plan.outputs.has_tasks }}
       task_count: ${{ steps.plan.outputs.task_count }}
+      selected_pollutants: ${{ steps.plan.outputs.selected_pollutants }}
+      scope: ${{ steps.plan.outputs.scope }}
 
     steps:
-      - name: Checkout public runner
+      - name: Checkout public processing runner
         uses: actions/checkout@v4
         with:
           path: runner
 
-      - name: Checkout private airsat-auto
+      - name: Checkout private airsat-auto data repository
         uses: actions/checkout@v4
         with:
           repository: Attarbashian/airsat-auto
@@ -47,97 +68,39 @@ jobs:
           fetch-depth: 1
           path: target
 
-      - name: Detect missing outputs and create queue
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Plan missing, stale, or corrupted outputs
         id: plan
         env:
-          POLLUTANT: ${{ inputs.pollutant }}
-          SCOPE: ${{ inputs.scope }}
-          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          SELECTED_POLLUTANT: ${{ github.event_name == 'workflow_dispatch' && inputs.pollutant || 'ALL' }}
+          SELECTED_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.scope || 'core' }}
+          FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.force_rebuild || false }}
         run: |
-          python - <<'PY'
-          import json, os
-          from datetime import datetime, timezone
-          from pathlib import Path
+          set -euo pipefail
+          args=(
+            --root target
+            --pollutant "$SELECTED_POLLUTANT"
+            --scope "$SELECTED_SCOPE"
+            --max-tasks 240
+          )
+          if [ "$FORCE_REBUILD" = "true" ]; then
+            args+=(--force-rebuild)
+          fi
+          python runner/scripts/plan_airsat_tasks.py "${args[@]}"
 
-          root = Path("target")
-          pollutant = os.environ["POLLUTANT"]
-          scope = os.environ["SCOPE"]
-          force = os.environ["FORCE_REBUILD"].lower() == "true"
-          tasks = []
-
-          def layer_complete(key):
-              if force:
-                  return False
-              base = root / "public" / "visual_real" / pollutant / key
-              stats = root / "public" / "data" / "stats" / pollutant / f"{key}.json"
-              return (
-                  (base / "Iran.webp").exists()
-                  and (base / "georef.json").exists()
-                  and stats.exists()
-                  and stats.stat().st_size > 50
-              )
-
-          for key in ["latest_7d","latest_30d","latest_90d","latest_month","current_year"]:
-              if not layer_complete(key):
-                  tasks.append({"kind":"dynamic","period_key":key})
-
-          for year in range(2018, 2026):
-              key = f"annual_{year}"
-              if not layer_complete(key):
-                  tasks.append({"kind":"annual","year":str(year),"period_key":key})
-
-          ts_path = root / "public" / "data" / "timeseries" / f"{pollutant}.json"
-          existing_periods = set()
-          if not force and ts_path.exists():
-              try:
-                  payload = json.loads(ts_path.read_text(encoding="utf-8"))
-                  for province in payload.get("provinces", []) or []:
-                      for point in province.get("series", []) or []:
-                          period = str(point.get("period") or "")
-                          if period:
-                              existing_periods.add(period)
-              except Exception:
-                  pass
-
-          now = datetime.now(timezone.utc)
-          for year in range(2018, now.year + 1):
-              last_month = 12 if year < now.year else now.month - 1
-              required = {f"{year}-{m:02d}" for m in range(1, last_month + 1)}
-              if required and (force or not required.issubset(existing_periods)):
-                  tasks.append({"kind":"timeseries","year":str(year),"period_key":f"timeseries_{year}"})
-
-          if scope == "complete":
-              for start in range(2018, 2025):
-                  for end in range(start + 1, 2026):
-                      key = f"range_{start}_{end}"
-                      if not layer_complete(key):
-                          tasks.append({
-                              "kind":"range",
-                              "start_year":str(start),
-                              "end_year":str(end),
-                              "period_key":key
-                          })
-
-          matrix = {"include": tasks}
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-              out.write("matrix=" + json.dumps(matrix, separators=(",",":")) + "\n")
-              out.write("has_tasks=" + ("true" if tasks else "false") + "\n")
-              out.write(f"task_count={len(tasks)}\n")
-
-          print(f"Planned {len(tasks)} tasks")
-          for i, task in enumerate(tasks, 1):
-              print(f"{i:02d}. {task}")
-          PY
-
-      - name: Write plan summary
+      - name: Planning summary
         run: |
-          echo "### AirSat automatic plan" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Pollutant: **${{ inputs.pollutant }}**" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Scope: **${{ inputs.scope }}**" >> "$GITHUB_STEP_SUMMARY"
+          echo "### AirSat data plan" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Pollutants: **${{ steps.plan.outputs.selected_pollutants }}**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Scope: **${{ steps.plan.outputs.scope }}**" >> "$GITHUB_STEP_SUMMARY"
           echo "- Planned tasks: **${{ steps.plan.outputs.task_count }}**" >> "$GITHUB_STEP_SUMMARY"
 
   build:
-    name: ${{ matrix.task.kind }} · ${{ matrix.task.period_key }}
+    name: ${{ matrix.task.pollutant }} · ${{ matrix.task.period_key }}
     needs: prepare
     if: needs.prepare.outputs.has_tasks == 'true'
     runs-on: ubuntu-latest
@@ -150,9 +113,11 @@ jobs:
         task: ${{ fromJSON(needs.prepare.outputs.matrix).include }}
 
     env:
-      AIRSAT_REPOSITORY_ROOT: ${{ github.workspace }}/target
       AIRSAT_START_YEAR: "2018"
       AIRSAT_THUMB_DIMENSIONS: "1200"
+      AIRSAT_VISUAL_EXPORT_DIMENSIONS: "1200,1000,800,650"
+      AIRSAT_DOWNLOAD_TIMEOUT: "420"
+      AIRSAT_MAX_DOWNLOAD_ATTEMPTS: "1"
       AIRSAT_STATS_SCALE: "7000"
       AIRSAT_STATS_CRS: "EPSG:4326"
       AIRSAT_WEB_CRS: "EPSG:3857"
@@ -161,19 +126,13 @@ jobs:
       AIRSAT_VISUAL_GAP_FILL: "true"
       AIRSAT_VISUAL_GAP_FILL_RADII_KM: "10,30,75"
       AIRSAT_VISUAL_FINAL_MEAN_FILL: "true"
-      AIRSAT_POLLUTANTS: ${{ inputs.pollutant }}
-      AIRSAT_SKIP_EXISTING: ${{ inputs.force_rebuild == false }}
-      SELECTED_POLLUTANT: ${{ inputs.pollutant }}
-      SELECTED_PERIOD: ${{ matrix.task.period_key }}
-      TASK_KIND: ${{ matrix.task.kind }}
-      TASK_YEAR: ${{ matrix.task.year }}
       EE_SERVICE_ACCOUNT_JSON: ${{ secrets.EE_SERVICE_ACCOUNT_JSON }}
       EE_PROJECT: ${{ secrets.EE_PROJECT }}
       EE_PROVINCES_ASSET: ${{ secrets.EE_PROVINCES_ASSET }}
       EE_PROVINCE_NAME_FIELD: ${{ secrets.EE_PROVINCE_NAME_FIELD }}
 
     steps:
-      - name: Checkout public runner
+      - name: Checkout public processing runner
         uses: actions/checkout@v4
         with:
           path: runner
@@ -194,66 +153,110 @@ jobs:
           cache: pip
           cache-dependency-path: runner/requirements-actions.txt
 
-      - name: Install dependencies
+      - name: Install processing dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r runner/requirements-actions.txt
 
-      - name: Build current queued unit
+      - name: Build and strictly validate one independent unit
         run: |
-          set -euo pipefail
-          case "$TASK_KIND" in
-            dynamic)
-              export AIRSAT_BUILD_MODE="daily"
-              export AIRSAT_PERIOD_KEYS="$SELECTED_PERIOD"
-              ;;
-            annual)
-              export AIRSAT_BUILD_MODE="bootstrap"
-              export AIRSAT_BUILD_TIMESERIES="false"
-              export AIRSAT_PERIOD_KEYS="$SELECTED_PERIOD"
-              ;;
-            timeseries)
-              export AIRSAT_BUILD_MODE="timeseries"
-              export AIRSAT_TIMESERIES_YEAR="$TASK_YEAR"
-              ;;
-            range)
-              export AIRSAT_BUILD_MODE="ranges"
-              export AIRSAT_PERIOD_KEYS="$SELECTED_PERIOD"
-              ;;
-            *)
-              echo "Unknown task: $TASK_KIND"
-              exit 2
-              ;;
-          esac
-          python runner/scripts/build_airsat_static.py
+          python runner/scripts/run_airsat_task.py \
+            --root target \
+            --runner-root runner \
+            --kind "${{ matrix.task.kind }}" \
+            --pollutant "${{ matrix.task.pollutant }}" \
+            --period-key "${{ matrix.task.period_key }}" \
+            --year "${{ matrix.task.year }}" \
+            --months "${{ matrix.task.months }}" \
+            --timeseries-periods "${{ matrix.task.timeseries_periods }}" \
+            --attempts 2 \
+            --attempt-timeout-seconds 7800
 
-      - name: Validate current unit
-        run: |
-          set -euo pipefail
-          if [ "$TASK_KIND" = "timeseries" ]; then
-            python runner/scripts/validate_airsat_outputs.py               --pollutants "$SELECTED_POLLUTANT"               --require-timeseries               --skip-layers               --min-series-points 1
-          else
-            python runner/scripts/validate_airsat_outputs.py               --pollutants "$SELECTED_POLLUTANT"               --periods "$SELECTED_PERIOD"               --require-stats
-          fi
-
-      - name: Save completed unit immediately to airsat-auto
+      - name: Commit this validated unit immediately
         working-directory: target
+        env:
+          COMMIT_MESSAGE: "data: ${{ matrix.task.pollutant }} ${{ matrix.task.period_key }}"
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add public/data public/visual_real
+
           if git diff --staged --quiet; then
-            echo "No generated changes for $SELECTED_PERIOD"
-          else
-            git commit -m "auto: $SELECTED_POLLUTANT $SELECTED_PERIOD"
+            echo "No generated changes for ${{ matrix.task.period_key }}"
+            exit 0
+          fi
+
+          git commit -m "$COMMIT_MESSAGE"
+
+          for attempt in 1 2 3; do
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              echo "Published on attempt $attempt"
+              exit 0
+            fi
+
+            git rebase --abort || true
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 20))
+            fi
+          done
+
+          echo "Could not publish the validated task after 3 attempts."
+          exit 1
+
+  audit:
+    name: Audit complete AirSat data contract
+    needs:
+      - prepare
+      - build
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout public processing runner
+        uses: actions/checkout@v4
+        with:
+          path: runner
+
+      - name: Checkout latest private airsat-auto
+        uses: actions/checkout@v4
+        with:
+          repository: Attarbashian/airsat-auto
+          ref: main
+          token: ${{ secrets.AIRSAT_AUTO_PAT }}
+          fetch-depth: 0
+          path: target
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Generate global data-health manifest
+        run: |
+          python runner/scripts/audit_airsat_data.py \
+            --root target \
+            --write-health \
+            --repair-catalog \
+            --strict-pollutants ALL \
+            --no-fail
+
+      - name: Publish health manifest and catalog normalization
+        working-directory: target
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add public/data/health public/data/catalog/layers.json
+
+          if ! git diff --staged --quiet; then
+            git commit -m "health: refresh AirSat data manifest"
             git pull --rebase origin main
             git push origin HEAD:main
           fi
 
-  nothing-to-do:
-    needs: prepare
-    if: needs.prepare.outputs.has_tasks != 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "همه خروجی‌های انتخاب‌شده از قبل کامل هستند."
+      - name: Enforce health for the selected pollutants
+        run: |
+          python runner/scripts/audit_airsat_data.py \
+            --root target \
+            --strict-pollutants "${{ needs.prepare.outputs.selected_pollutants }}"
