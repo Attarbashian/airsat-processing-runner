@@ -43,6 +43,14 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Cache OpenStreetMap tiles
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/airsat-osm
+          key: airsat-osm-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            airsat-osm-${{ runner.os }}-
+
       - name: Install Persian Vazir font and Python dependencies
         run: |
           set -euo pipefail
@@ -68,6 +76,12 @@ jobs:
           AIRSAT_AUTO_ROOT: ${{ github.workspace }}/target
           AIRSAT_FONT_DIR: /usr/local/share/fonts/airsat
           AIRSAT_TIMESERIES_FALLBACK: "true"
+          AIRSAT_OSM_CACHE_DIR: ~/.cache/airsat-osm
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          AIRSAT_EMAIL_FROM: ${{ secrets.AIRSAT_EMAIL_FROM }}
+          AIRSAT_EMAIL_REPLY_TO: ${{ secrets.AIRSAT_EMAIL_REPLY_TO }}
+          SMSIR_API_KEY: ${{ secrets.SMSIR_API_KEY }}
+          SMSIR_READY_TEMPLATE_ID: ${{ secrets.SMSIR_READY_TEMPLATE_ID }}
           EE_SERVICE_ACCOUNT_JSON: ${{ secrets.EE_SERVICE_ACCOUNT_JSON }}
           EE_PROJECT: ${{ secrets.EE_PROJECT }}
           EE_PROVINCES_ASSET: ${{ secrets.EE_PROVINCES_ASSET }}

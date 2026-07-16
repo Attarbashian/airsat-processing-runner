@@ -1,0 +1,34 @@
+name: AirSat Supabase Heartbeat
+
+on:
+  schedule:
+    # 00:10 Iran time (UTC+03:30)
+    - cron: "40 20 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: airsat-supabase-heartbeat
+  cancel-in-progress: true
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Run a real lightweight health query
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$SUPABASE_URL"
+          test -n "$SUPABASE_SERVICE_ROLE_KEY"
+          curl --fail --silent --show-error \
+            --header "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            --header "Accept: application/json" \
+            "$SUPABASE_URL/rest/v1/site_settings?select=key&limit=1" \
+            >/dev/null
+          echo "AirSat Supabase heartbeat completed."
