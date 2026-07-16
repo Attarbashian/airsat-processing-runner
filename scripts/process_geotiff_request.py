@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Process one AirSat GeoTIFF request and upload a temporary ZIP to Supabase."""
+"""AirSat Export Processor v3.2: create GeoTIFF and polished branded outputs."""
 
 from __future__ import annotations
 
@@ -114,13 +114,34 @@ PERIOD_FA = {
     "current_year": "سال جاری",
 }
 
+ZIP_CONTENT_KEYS = [
+    "geotiff",
+    "map_png",
+    "metadata_txt",
+    "shortcut",
+    "timeseries_png",
+    "timeseries_csv",
+    "timeseries_json",
+]
+
+ZIP_CONTENT_LABELS_FA = {
+    "geotiff": "GeoTIFF",
+    "map_png": "نقشه PNG",
+    "metadata_txt": "شناسنامه خروجی",
+    "shortcut": "میان‌بر AirSat",
+    "timeseries_png": "نمودار سری زمانی",
+    "timeseries_csv": "جدول CSV سری زمانی",
+    "timeseries_json": "داده JSON سری زمانی",
+}
+
 OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
-OSM_USER_AGENT = "AirSat/3.0 (https://airsat.ir; info@airsat.ir)"
+OSM_USER_AGENT = "AirSat/3.2 (https://airsat.ir; info@airsat.ir)"
 REPORT_BLUE_TOP = "#0f4f91"
 REPORT_BLUE_BOTTOM = "#1768ad"
 REPORT_INK = "#18344f"
 REPORT_MUTED = "#60788f"
 REPORT_LINE = "#c9d6e3"
+REPORT_OVERLAY_OPACITY = 0.80
 
 
 def period_fa(period_key: str, start: str, end: str) -> str:
@@ -1078,31 +1099,59 @@ def draw_header(
     title_fa: str,
     generated_at: str,
 ) -> None:
+    """Draw the shared AirSat report header without an image logo.
+
+    The time-series and map reports deliberately use the same restrained
+    textual wordmark so the title area remains uncluttered.
+    """
     header = (30, 28, width - 30, 174)
     draw_gradient_round_rect(image, header, 30, REPORT_BLUE_TOP, REPORT_BLUE_BOTTOM)
 
-    # Fixed logo zone: the real AirSat logo is scaled, never clipped.
-    logo = load_brand_logo(325, 102)
-    if logo is not None:
-        logo_x = width - 68 - logo.width
-        logo_y = header[1] + (header[3] - header[1] - logo.height) // 2
-        image.paste(logo, (logo_x, logo_y), logo)
-    else:
-        draw.text((width - 300, 58), "AirSat", fill="white", font=font(42, bold=True))
+    draw_ltr(
+        draw,
+        70,
+        58,
+        "Sentinel-5P / TROPOMI  •  Google Earth Engine  •  airsat.ir",
+        selected_font=font(16),
+        fill="white",
+    )
+    draw_ltr(
+        draw,
+        70,
+        108,
+        generated_at,
+        selected_font=font(14),
+        fill="#d9ecff",
+    )
 
-    draw_ltr(draw, 70, 67, "Sentinel-5P / TROPOMI  •  Google Earth Engine  •  airsat.ir", selected_font=font(16), fill="white")
-    draw_ltr(draw, 70, 111, generated_at, selected_font=font(14), fill="#d9ecff")
+    # Textual brand only; no graphic logo or watermark.
+    draw_ltr(
+        draw,
+        width - 280,
+        49,
+        "AirSat",
+        selected_font=font(42, bold=True),
+        fill="white",
+    )
+    draw_ltr(
+        draw,
+        width - 280,
+        104,
+        "Satellite-powered air monitoring",
+        selected_font=font(13),
+        fill="#d9ecff",
+    )
 
-    # Reserved title zone cannot collide with the logo or metadata.
-    title_left, title_right = 500, width - 410
+    # A broad, collision-safe title area shared by both report types.
     draw_centered_rtl(
         draw,
-        (title_left + title_right) / 2,
-        76,
+        width / 2,
+        90,
         title_fa,
         selected_font=font(24, bold=True),
         fill="white",
     )
+
 
 def compute_linear_trend(values: list[float]) -> tuple[float, float, float]:
     n = len(values)
@@ -1162,9 +1211,9 @@ def compose_preview(
     title = f"نقشه مکانی {POLLUTANT_FA[row['pollutant']]} در استان {row.get('province_name')}"
     draw_header(image, draw, width, title, generated)
 
-    body = (60, 200, width - 60, 870)
+    body = (60, 200, width - 60, 858)
     draw.rounded_rectangle(body, radius=28, fill="#fbfdff", outline=REPORT_LINE, width=2)
-    map_box = (92, 230, width - 92, 825)
+    map_box = (92, 230, width - 92, 813)
     map_width, map_height = map_box[2] - map_box[0], map_box[3] - map_box[1]
 
     try:
@@ -1176,7 +1225,9 @@ def compose_preview(
         draw_centered_rtl(fallback_draw, map_width / 2, map_height / 2 - 14, "نقشه پایه موقتاً در دسترس نیست", selected_font=font(20), fill="#60788f")
 
     raw = Image.open(raw_png).convert("RGBA").resize((map_width, map_height), Image.Resampling.LANCZOS)
-    alpha = raw.getchannel("A").point(lambda value: round(value * 0.85))
+    alpha = raw.getchannel("A").point(
+        lambda value: round(value * REPORT_OVERLAY_OPACITY)
+    )
     raw.putalpha(alpha)
     composed = basemap.convert("RGBA")
     composed.alpha_composite(raw)
@@ -1217,7 +1268,15 @@ def compose_preview(
     draw_rtl(draw, width - 92, footer_top + 25, "مشخصات داده", selected_font=font(20, bold=True), fill=REPORT_INK)
     draw_label_value_rtl(draw, width - 92, footer_top + 70, "آلاینده:", row["pollutant"], label_font=font(17), value_font=font(17))
     draw_label_value_rtl(draw, width - 92, footer_top + 108, "واحد:", cfg["unit"], label_font=font(17), value_font=font(17))
-    draw_label_value_rtl(draw, width - 92, footer_top + 146, "شفافیت لایه:", "85%", label_font=font(17), value_font=font(17))
+    draw_label_value_rtl(
+        draw,
+        width - 92,
+        footer_top + 146,
+        "شفافیت لایه:",
+        f"{round(REPORT_OVERLAY_OPACITY * 100)}%",
+        label_font=font(17),
+        value_font=font(17),
+    )
     draw_ltr(draw, 850, footer_top + 184, "Sentinel-5P / TROPOMI • Google Earth Engine", selected_font=font(15), fill="#526b83")
 
     draw.text((70, height - 48), "© AirSat  •  OpenStreetMap contributors  •  airsat.ir", fill="#6f8396", font=font(16))
@@ -1267,6 +1326,15 @@ def setting_bool(settings: dict[str, Any], key: str, default: bool = False) -> b
     if isinstance(value, dict) and "enabled" in value:
         return bool(value["enabled"])
     return str(value).lower() in {"1", "true", "yes", "on"}
+
+
+def get_zip_content_selection() -> list[str]:
+    settings = get_site_settings(["exports.zip_contents"])
+    value = settings.get("exports.zip_contents")
+    if not isinstance(value, list):
+        return list(ZIP_CONTENT_KEYS)
+    selected = [str(item) for item in value if str(item) in ZIP_CONTENT_KEYS]
+    return selected or ["metadata_txt"]
 
 
 def get_profile(user_id: str) -> dict[str, Any]:
@@ -1579,6 +1647,7 @@ def main() -> None:
                     )
 
             windows_shortcut = write_shortcut(folder)
+            selected_zip_contents = get_zip_content_selection()
 
             metadata.write_text(
                 "\n".join(
@@ -1599,22 +1668,39 @@ def main() -> None:
                         f"Band: {cfg['band']}",
                         f"Nominal export scale: 7000 m",
                         "CRS: EPSG:4326",
+                        "ZIP configuration: " + ", ".join(selected_zip_contents),
                         "Website: https://airsat.ir",
                     ]
                 ),
                 encoding="utf-8",
             )
 
+            available_zip_files: dict[str, Path] = {
+                "geotiff": geotiff,
+                "map_png": preview,
+                "metadata_txt": metadata,
+                "shortcut": windows_shortcut,
+            }
+            if series:
+                available_zip_files.update({
+                    "timeseries_png": timeseries_chart,
+                    "timeseries_csv": timeseries_csv,
+                    "timeseries_json": timeseries_json,
+                })
+
+            included_zip_keys = [
+                key
+                for key in selected_zip_contents
+                if key in available_zip_files and available_zip_files[key].exists()
+            ]
+            # A configuration containing only time-series files may produce no files
+            # when the series is unavailable. Keep the package valid and informative.
+            if not included_zip_keys:
+                included_zip_keys = ["metadata_txt"]
+
             with zipfile.ZipFile(output_zip, "w", zipfile.ZIP_DEFLATED) as archive:
-                files = [
-                    geotiff,
-                    preview,
-                    metadata,
-                    windows_shortcut,
-                ]
-                if series:
-                    files.extend([timeseries_chart, timeseries_csv, timeseries_json])
-                for file in files:
+                for key in included_zip_keys:
+                    file = available_zip_files[key]
                     archive.write(file, file.name)
 
             # Free Supabase projects currently cap an individual file at 50 MB.
@@ -1639,7 +1725,11 @@ def main() -> None:
                     "file_name": output_zip.name,
                     "expires_at": expires_at.isoformat(),
                     "notification_results": notification_results,
-                    "message": f"بسته شامل GeoTIFF، نقشه OSM با لایه ۸۵٪ و سری زمانی همراه پیش‌بینی است؛ تا {expiry_hours} ساعت قابل دانلود خواهد بود.",
+                    "message": (
+                        "بسته آماده است و شامل "
+                        + "، ".join(ZIP_CONTENT_LABELS_FA[key] for key in included_zip_keys)
+                        + f" است؛ تا {expiry_hours} ساعت قابل دانلود خواهد بود."
+                    ),
                     "error": None,
                 },
             )
