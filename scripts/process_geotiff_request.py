@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import csv
 import json
 import math
@@ -10,6 +11,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import zipfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -18,7 +20,7 @@ from urllib.parse import quote
 
 import ee
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 try:
     import arabic_reshaper
@@ -94,6 +96,45 @@ POLLUTANTS: dict[str, dict[str, Any]] = {
     },
 }
 
+POLLUTANT_FA = {
+    "NO2": "دی‌اکسید نیتروژن",
+    "SO2": "دی‌اکسید گوگرد",
+    "CO": "مونوکسید کربن",
+    "O3": "ازن",
+    "HCHO": "فرمالدهید",
+    "AER_AI": "شاخص جذب آئروسل",
+    "CH4": "متان",
+}
+
+PERIOD_FA = {
+    "latest_7d": "هفت روز اخیر",
+    "latest_30d": "سی روز اخیر",
+    "latest_90d": "نود روز اخیر",
+    "latest_month": "ماه کامل قبلی",
+    "current_year": "سال جاری",
+}
+
+OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+OSM_USER_AGENT = "AirSat/3.0 (https://airsat.ir; info@airsat.ir)"
+REPORT_BLUE_TOP = "#0f4f91"
+REPORT_BLUE_BOTTOM = "#1768ad"
+REPORT_INK = "#18344f"
+REPORT_MUTED = "#60788f"
+REPORT_LINE = "#c9d6e3"
+
+
+def period_fa(period_key: str, start: str, end: str) -> str:
+    key = str(period_key or "")
+    if key in PERIOD_FA:
+        return PERIOD_FA[key]
+    if key.startswith("annual_"):
+        return f"سال {key.split('_')[-1]}"
+    if key.startswith("range_"):
+        parts = key.split("_")
+        return f"از سال {parts[1]} تا {parts[2]}"
+    return f"از {start} تا {end}"
+
+
 
 def required(name: str) -> str:
     value = os.getenv(name, "").strip()
@@ -149,7 +190,7 @@ def update_request(request_id: str, payload: dict[str, Any]) -> None:
     metadata = dict(current.get("metadata") or {})
     outgoing = dict(payload)
 
-    for key in ("message", "file_name"):
+    for key in ("message", "file_name", "notification_results"):
         if key in outgoing:
             metadata[key] = outgoing.pop(key)
 
@@ -308,13 +349,136 @@ def font(size: int, bold: bool = False) -> ImageFont.ImageFont:
 
 
 
-def display_text(value: Any) -> str:
-    """Shape Persian/Arabic text correctly when optional packages are installed."""
-    text = str(value or "")
-    if arabic_reshaper is not None and get_display is not None and re.search(r"[\u0600-\u06FF]", text):
-        return get_display(arabic_reshaper.reshape(text))
-    return text
+def shape_fa(value: Any) -> str:
+    """Shape a Persian-only string for Pillow without mixing LTR fragments."""
+    value = str(value or "")
+    if arabic_reshaper is not None and get_display is not None:
+        return get_display(arabic_reshaper.reshape(value))
+    return value
 
+
+def display_text(value: Any) -> str:
+    # Compatibility alias. Mixed Persian/Latin text must not be passed here.
+    return shape_fa(value)
+
+
+def text_width(draw: ImageDraw.ImageDraw, value: str, selected_font: ImageFont.ImageFont) -> float:
+    return float(draw.textlength(value, font=selected_font))
+
+
+def draw_rtl(
+    draw: ImageDraw.ImageDraw,
+    right_x: float,
+    y: float,
+    value: Any,
+    *,
+    selected_font: ImageFont.ImageFont,
+    fill: str,
+) -> float:
+    shaped = shape_fa(value)
+    width = text_width(draw, shaped, selected_font)
+    draw.text((right_x - width, y), shaped, font=selected_font, fill=fill)
+    return width
+
+
+def draw_centered_rtl(
+    draw: ImageDraw.ImageDraw,
+    center_x: float,
+    y: float,
+    value: Any,
+    *,
+    selected_font: ImageFont.ImageFont,
+    fill: str,
+) -> None:
+    shaped = shape_fa(value)
+    width = text_width(draw, shaped, selected_font)
+    draw.text((center_x - width / 2, y), shaped, font=selected_font, fill=fill)
+
+
+def draw_ltr(
+    draw: ImageDraw.ImageDraw,
+    x: float,
+    y: float,
+    value: Any,
+    *,
+    selected_font: ImageFont.ImageFont,
+    fill: str,
+) -> float:
+    text = str(value or "")
+    draw.text((x, y), text, font=selected_font, fill=fill)
+    return text_width(draw, text, selected_font)
+
+
+def draw_label_value_rtl(
+    draw: ImageDraw.ImageDraw,
+    right_x: float,
+    y: float,
+    label_fa: str,
+    value_ltr: Any,
+    *,
+    label_font: ImageFont.ImageFont,
+    value_font: ImageFont.ImageFont,
+    fill: str = REPORT_INK,
+    gap: int = 12,
+) -> None:
+    label_width = draw_rtl(
+        draw,
+        right_x,
+        y,
+        label_fa,
+        selected_font=label_font,
+        fill=fill,
+    )
+    value = str(value_ltr or "")
+    if re.search(r"[\u0600-\u06FF]", value):
+        value = shape_fa(value)
+    value_width = text_width(draw, value, value_font)
+    draw.text(
+        (right_x - label_width - gap - value_width, y),
+        value,
+        font=value_font,
+        fill=fill,
+    )
+
+
+def draw_gradient_round_rect(
+    image: Image.Image,
+    box: tuple[int, int, int, int],
+    radius: int,
+    top_color: str,
+    bottom_color: str,
+) -> None:
+    left, top, right, bottom = box
+    width, height = right - left, bottom - top
+    gradient = Image.new("RGB", (width, height), top_color)
+    top_rgb = tuple(int(top_color[i:i+2], 16) for i in (1, 3, 5))
+    bottom_rgb = tuple(int(bottom_color[i:i+2], 16) for i in (1, 3, 5))
+    pixels = gradient.load()
+    for y in range(height):
+        ratio = y / max(1, height - 1)
+        color = tuple(round(a + (b - a) * ratio) for a, b in zip(top_rgb, bottom_rgb))
+        for x in range(width):
+            pixels[x, y] = color
+    mask = Image.new("L", (width, height), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, width, height), radius=radius, fill=255)
+    image.paste(gradient, (left, top), mask)
+
+
+def load_brand_logo(max_width: int = 330, max_height: int = 105) -> Image.Image | None:
+    root = os.getenv("AIRSAT_AUTO_ROOT", "").strip()
+    candidates = []
+    if root:
+        candidates.append(Path(root) / "public" / "assets" / "airsat-logo.png")
+    candidates.extend([
+        Path("target/public/assets/airsat-logo.png"),
+        Path("public/assets/airsat-logo.png"),
+    ])
+    for candidate in candidates:
+        if candidate.exists():
+            logo = Image.open(candidate).convert("RGBA")
+            logo.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
+            return logo
+    return None
 
 def normalize_name(value: Any) -> str:
     text = str(value or "").strip().lower()
@@ -334,10 +498,10 @@ def normalize_name(value: Any) -> str:
 
 COUNTRY_LEVEL_REGION_NAMES = {
     "iran",
-    "islamic republic of iran",
+    "islamicrepublicofiran",
     "ایران",
-    "کل ایران",
-    "سراسر ایران",
+    "کلایران",
+    "سراسرایران",
     "all",
     "country",
     "national",
@@ -358,6 +522,216 @@ def validate_province_only_request(row: dict[str, Any]) -> None:
             "GeoTIFF export is restricted to one selected province. "
             "Nationwide export is not permitted."
         )
+
+
+def region_bbox(region: ee.Geometry, padding_ratio: float = 0.075) -> tuple[float, float, float, float]:
+    coordinates = region.bounds(maxError=1000).coordinates().getInfo()[0]
+    longitudes = [float(point[0]) for point in coordinates]
+    latitudes = [float(point[1]) for point in coordinates]
+    west, east = min(longitudes), max(longitudes)
+    south, north = min(latitudes), max(latitudes)
+    dx = max(0.05, (east - west) * padding_ratio)
+    dy = max(0.05, (north - south) * padding_ratio)
+    return west - dx, south - dy, east + dx, north + dy
+
+
+def tile_xy(lon: float, lat: float, zoom: int) -> tuple[float, float]:
+    lat = max(-85.05112878, min(85.05112878, lat))
+    scale = 2 ** zoom
+    x = (lon + 180.0) / 360.0 * scale
+    y = (1.0 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2.0 * scale
+    return x, y
+
+
+def choose_osm_zoom(
+    bbox: tuple[float, float, float, float],
+    target_width: int,
+    target_height: int,
+) -> int:
+    west, south, east, north = bbox
+    for zoom in range(12, 4, -1):
+        x1, y1 = tile_xy(west, north, zoom)
+        x2, y2 = tile_xy(east, south, zoom)
+        pixel_width = abs(x2 - x1) * 256
+        pixel_height = abs(y2 - y1) * 256
+        tile_count = (math.floor(x2) - math.floor(x1) + 1) * (math.floor(y2) - math.floor(y1) + 1)
+        if pixel_width >= target_width * 0.9 and pixel_height >= target_height * 0.75 and tile_count <= 36:
+            return zoom
+    return 6
+
+
+def osm_tile_path(cache_dir: Path, zoom: int, x: int, y: int) -> Path:
+    return cache_dir / str(zoom) / str(x) / f"{y}.png"
+
+
+def download_osm_tile(cache_dir: Path, zoom: int, x: int, y: int) -> Image.Image:
+    path = osm_tile_path(cache_dir, zoom, x, y)
+    if path.exists() and path.stat().st_size > 1000:
+        return Image.open(path).convert("RGB")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    url = OSM_TILE_URL.format(z=zoom, x=x, y=y)
+    response = requests.get(
+        url,
+        headers={
+            "User-Agent": OSM_USER_AGENT,
+            "Referer": "https://airsat.ir/",
+        },
+        timeout=45,
+    )
+    response.raise_for_status()
+    temporary = path.with_suffix(".tmp")
+    temporary.write_bytes(response.content)
+    temporary.replace(path)
+    time.sleep(0.08)
+    return Image.open(path).convert("RGB")
+
+
+def build_osm_basemap(
+    bbox: tuple[float, float, float, float],
+    width: int,
+    height: int,
+) -> Image.Image:
+    cache_dir = Path(os.getenv("AIRSAT_OSM_CACHE_DIR", ".cache/airsat-osm"))
+    west, south, east, north = bbox
+    zoom = choose_osm_zoom(bbox, width, height)
+    x1, y1 = tile_xy(west, north, zoom)
+    x2, y2 = tile_xy(east, south, zoom)
+    min_x, max_x = math.floor(x1), math.floor(x2)
+    min_y, max_y = math.floor(y1), math.floor(y2)
+    scale = 2 ** zoom
+
+    mosaic = Image.new(
+        "RGB",
+        ((max_x - min_x + 1) * 256, (max_y - min_y + 1) * 256),
+        "#e8edf2",
+    )
+    for tile_x in range(min_x, max_x + 1):
+        for tile_y in range(min_y, max_y + 1):
+            wrapped_x = tile_x % scale
+            if tile_y < 0 or tile_y >= scale:
+                continue
+            tile = download_osm_tile(cache_dir, zoom, wrapped_x, tile_y)
+            mosaic.paste(tile, ((tile_x - min_x) * 256, (tile_y - min_y) * 256))
+
+    crop_box = (
+        round((x1 - min_x) * 256),
+        round((y1 - min_y) * 256),
+        round((x2 - min_x) * 256),
+        round((y2 - min_y) * 256),
+    )
+    cropped = mosaic.crop(crop_box)
+    return cropped.resize((width, height), Image.Resampling.LANCZOS)
+
+
+def solve_linear_system(matrix: list[list[float]], vector: list[float]) -> list[float] | None:
+    n = len(vector)
+    augmented = [list(row) + [vector[index]] for index, row in enumerate(matrix)]
+    for column in range(n):
+        pivot = max(range(column, n), key=lambda row: abs(augmented[row][column]))
+        if abs(augmented[pivot][column]) < 1e-12:
+            return None
+        augmented[column], augmented[pivot] = augmented[pivot], augmented[column]
+        divisor = augmented[column][column]
+        augmented[column] = [value / divisor for value in augmented[column]]
+        for row in range(n):
+            if row == column:
+                continue
+            factor = augmented[row][column]
+            augmented[row] = [
+                value - factor * base
+                for value, base in zip(augmented[row], augmented[column])
+            ]
+    return [row[-1] for row in augmented]
+
+
+def add_months_label(label: str, count: int) -> str:
+    match = re.search(r"(\d{4})-(\d{1,2})", str(label))
+    if not match:
+        return str(label)
+    year, month = int(match.group(1)), int(match.group(2))
+    month_index = year * 12 + month - 1 + count
+    return f"{month_index // 12:04d}-{month_index % 12 + 1:02d}"
+
+
+def lightweight_seasonal_forecast(
+    series: list[dict[str, Any]],
+    pollutant: str,
+    horizon: int = 6,
+) -> dict[str, Any] | None:
+    values = [float(item["value"]) for item in series]
+    count = len(values)
+    if count < 3:
+        return None
+    non_negative = pollutant != "AER_AI"
+    model: dict[str, Any] | None = None
+
+    if count >= 24:
+        size = 4
+        xtx = [[0.0] * size for _ in range(size)]
+        xty = [0.0] * size
+        samples = []
+        for index in range(12, count):
+            features = [1.0, float(index), values[index - 1], values[index - 12]]
+            target = values[index]
+            samples.append((features, target))
+            for i in range(size):
+                xty[i] += features[i] * target
+                for j in range(size):
+                    xtx[i][j] += features[i] * features[j]
+        for index in range(size):
+            xtx[index][index] += 1e-9
+        beta = solve_linear_system(xtx, xty)
+        if beta:
+            residuals = [
+                target - sum(value * beta[i] for i, value in enumerate(features))
+                for features, target in samples
+            ]
+            rss = sum(value * value for value in residuals)
+            mean = sum(target for _, target in samples) / len(samples)
+            tss = sum((target - mean) ** 2 for _, target in samples)
+            model = {
+                "type": "seasonal",
+                "name_fa": "خودرگرسیون فصلی سبک AR(1,12)",
+                "beta": beta,
+                "sigma": math.sqrt(rss / max(1, len(samples) - size)),
+                "r2": 1 - rss / tss if tss > 0 else 1.0,
+            }
+
+    if model is None:
+        slope, intercept, r2 = compute_linear_trend(values)
+        residuals = [value - (slope * index + intercept) for index, value in enumerate(values)]
+        sigma = math.sqrt(sum(value * value for value in residuals) / max(1, count - 2))
+        model = {
+            "type": "linear",
+            "name_fa": "روند خطی سبک",
+            "slope": slope,
+            "intercept": intercept,
+            "sigma": sigma,
+            "r2": r2,
+        }
+
+    work = list(values)
+    forecast = []
+    for step in range(1, horizon + 1):
+        index = len(work)
+        if model["type"] == "seasonal":
+            b0, b1, phi1, phi12 = model["beta"]
+            value = b0 + b1 * index + phi1 * work[index - 1] + phi12 * work[index - 12]
+        else:
+            value = model["slope"] * index + model["intercept"]
+        if non_negative:
+            value = max(0.0, value)
+        work.append(value)
+        margin = 1.96 * float(model.get("sigma") or 0.0) * math.sqrt(step)
+        forecast.append({
+            "period": add_months_label(series[-1]["period"], step),
+            "value": value,
+            "low": max(0.0, value - margin) if non_negative else value - margin,
+            "high": value + margin,
+        })
+    model["forecast"] = forecast
+    return model
 
 def load_precomputed_timeseries(row: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
     """Load province time series already generated in the private airsat-auto repo."""
@@ -503,14 +877,21 @@ def write_timeseries_files(
     row: dict[str, Any],
     cfg: dict[str, Any],
     source: str,
+    forecast_model: dict[str, Any] | None,
 ) -> None:
     with csv_path.open("w", newline="", encoding="utf-8-sig") as file:
         writer = csv.DictWriter(
             file,
-            fieldnames=["period", "value", "min", "max", "image_count", "interpolated"],
+            fieldnames=[
+                "period", "value", "kind", "low", "high",
+                "min", "max", "image_count", "interpolated",
+            ],
         )
         writer.writeheader()
-        writer.writerows(series)
+        for item in series:
+            writer.writerow({**item, "kind": "observed", "low": None, "high": None})
+        for item in (forecast_model or {}).get("forecast", []):
+            writer.writerow({**item, "kind": "forecast"})
 
     json_path.write_text(
         json.dumps(
@@ -520,6 +901,7 @@ def write_timeseries_files(
                 "unit": cfg["unit"],
                 "source": source,
                 "series": series,
+                "forecast_model": forecast_model,
             },
             ensure_ascii=False,
             indent=2,
@@ -527,114 +909,145 @@ def write_timeseries_files(
         encoding="utf-8",
     )
 
-
 def draw_timeseries_chart(
     series: list[dict[str, Any]],
     output: Path,
     row: dict[str, Any],
     cfg: dict[str, Any],
     source: str,
+    forecast_model: dict[str, Any] | None,
 ) -> None:
-    width, height = 1600, 1080
+    width, height = 1600, 1200
     image = Image.new("RGB", (width, height), "#dfe7ef")
     draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((30, 26, width - 30, height - 26), radius=32, fill="#eef3f8")
 
-    draw.rounded_rectangle((34, 30, width - 34, height - 34), radius=30, fill="#eef3f8")
-    generated = datetime.now().strftime("%Y-%m-%d, %H:%M UTC")
-    title = f"Monthly time series of {row['pollutant']} in {row.get('province_name')}"
-    draw_header(draw, width, title, generated)
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d، %H:%M UTC")
+    title = f"سری زمانی ماهانه {POLLUTANT_FA[row['pollutant']]} در استان {row.get('province_name')}"
+    draw_header(image, draw, width, title, generated)
 
-    body = (64, 200, width - 64, 870)
-    draw.rounded_rectangle(body, radius=28, fill="#f8fbfd", outline="#c9d6e3", width=2)
+    body = (60, 200, width - 60, 858)
+    draw.rounded_rectangle(body, radius=28, fill="#fbfdff", outline=REPORT_LINE, width=2)
+    chart_left, chart_top, chart_right, chart_bottom = 185, 315, width - 105, 760
 
-    chart_left, chart_top, chart_right, chart_bottom = 300, 320, width - 400, 710
-    values = [float(item["value"]) for item in series]
-    minimum, maximum = min(values), max(values)
-    padding = (maximum - minimum) * 0.12 if not math.isclose(minimum, maximum) else abs(minimum) * 0.08 or 1.0
+    observed_values = [float(item["value"]) for item in series]
+    forecast = (forecast_model or {}).get("forecast", [])
+    y_candidates = list(observed_values)
+    for item in forecast:
+        y_candidates.extend([float(item["low"]), float(item["high"])])
+    minimum, maximum = min(y_candidates), max(y_candidates)
+    padding = (maximum - minimum) * 0.10 if not math.isclose(minimum, maximum) else abs(minimum) * 0.08 or 1.0
     y_min, y_max = minimum - padding, maximum + padding
 
-    # legend
-    legend_y = 260
-    draw.line((500, legend_y, 540, legend_y), fill="#135fb3", width=5)
-    draw.text((548, legend_y - 12), display_text("Observed"), fill="#425b76", font=font(16))
-    draw.line((700, legend_y, 740, legend_y), fill="#9ab5d4", width=3)
-    draw.text((748, legend_y - 12), display_text("Trend"), fill="#425b76", font=font(16))
+    # Legend with pure Persian labels.
+    legend_y = 252
+    legend_items = [
+        ("#135fb3", None, "مشاهده‌شده"),
+        ("#8ca9c8", "5 5", "روند خطی"),
+        ("#ef8b2c", "8 5", "پیش‌بینی شش‌ماهه"),
+    ]
+    legend_x = 1080
+    for color, dash, label in legend_items:
+        draw.line((legend_x, legend_y, legend_x + 42, legend_y), fill=color, width=4)
+        draw_rtl(draw, legend_x - 10, legend_y - 14, label, selected_font=font(17), fill="#425b76")
+        legend_x -= 220
 
-    # grid
+    # Grid and y-axis labels.
     for step in range(6):
         y = chart_top + (chart_bottom - chart_top) * step / 5
         value = y_max - (y_max - y_min) * step / 5
         draw.line((chart_left, y, chart_right, y), fill="#d7e2ee", width=1)
         label = format_value(value)
-        tw = draw.textlength(label, font=font(16))
-        draw.text((chart_left - tw - 16, y - 10), label, fill="#5d748c", font=font(16))
+        tw = text_width(draw, label, font(16))
+        draw.text((chart_left - tw - 14, y - 10), label, fill="#5d748c", font=font(16))
 
-    count = len(series)
-    points = []
-    for index, item in enumerate(series):
-        x = chart_left if count == 1 else chart_left + (chart_right - chart_left) * index / (count - 1)
-        y = chart_bottom - (float(item["value"]) - y_min) * (chart_bottom - chart_top) / (y_max - y_min)
-        points.append((x, y))
+    combined_count = len(series) + len(forecast)
+    x = lambda index: chart_left + (chart_right - chart_left) * index / max(1, combined_count - 1)
+    y_of = lambda value: chart_bottom - (float(value) - y_min) * (chart_bottom - chart_top) / max(1e-18, y_max - y_min)
 
-    # trend line
-    slope, intercept, r2 = compute_linear_trend(values)
-    trend_points = []
-    for index in range(count):
-        trend = slope * index + intercept
-        x = chart_left if count == 1 else chart_left + (chart_right - chart_left) * index / (count - 1)
-        y = chart_bottom - (trend - y_min) * (chart_bottom - chart_top) / (y_max - y_min)
-        trend_points.append((x, y))
+    observed_points = [(x(index), y_of(item["value"])) for index, item in enumerate(series)]
+    if len(observed_points) > 1:
+        draw.line(observed_points, fill="#135fb3", width=5)
+    for px, py in observed_points:
+        draw.ellipse((px - 3.5, py - 3.5, px + 3.5, py + 3.5), fill="#135fb3")
+
+    slope, intercept, r2 = compute_linear_trend(observed_values)
+    trend_points = [
+        (x(index), y_of(slope * index + intercept))
+        for index in range(len(series))
+    ]
     if len(trend_points) > 1:
-        draw.line(trend_points, fill="#9ab5d4", width=3)
+        draw.line(trend_points, fill="#8ca9c8", width=3)
 
-    if len(points) > 1:
-        draw.line(points, fill="#135fb3", width=5)
-    for x, y in points:
-        draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill="#135fb3")
+    if forecast:
+        upper = [(x(len(series) + index), y_of(item["high"])) for index, item in enumerate(forecast)]
+        lower = [(x(len(series) + index), y_of(item["low"])) for index, item in enumerate(forecast)]
+        band = upper + list(reversed(lower))
+        band_layer = Image.new("RGBA", image.size, (0, 0, 0, 0))
+        ImageDraw.Draw(band_layer).polygon(band, fill=(239, 139, 44, 45))
+        image.alpha_composite(band_layer) if image.mode == "RGBA" else image.paste(band_layer, (0, 0), band_layer)
+        forecast_points = [(x(len(series) + index), y_of(item["value"])) for index, item in enumerate(forecast)]
+        path = [observed_points[-1], *forecast_points]
+        for index in range(len(path) - 1):
+            # Dashed orange forecast line.
+            x1, y1 = path[index]
+            x2, y2 = path[index + 1]
+            segments = 14
+            for segment in range(0, segments, 2):
+                a = segment / segments
+                b = min(1.0, (segment + 1) / segments)
+                draw.line(
+                    (
+                        x1 + (x2 - x1) * a,
+                        y1 + (y2 - y1) * a,
+                        x1 + (x2 - x1) * b,
+                        y1 + (y2 - y1) * b,
+                    ),
+                    fill="#ef8b2c",
+                    width=4,
+                )
+        for px, py in forecast_points:
+            draw.ellipse((px - 4, py - 4, px + 4, py + 4), fill="#ef8b2c")
 
-    # x-axis labels tilted, one or two per year
-    label_indices = []
-    if count <= 18:
-        label_indices = list(range(count))
-    else:
-        seen = set()
-        for i, item in enumerate(series):
-            year = item['period'][:4]
-            if year not in seen:
-                label_indices.append(i)
-                seen.add(year)
+    # X-axis: annual labels plus the final forecast month.
+    labels: list[tuple[int, str]] = []
+    seen_years: set[str] = set()
+    for index, item in enumerate(series):
+        year = item["period"][:4]
+        if year not in seen_years:
+            labels.append((index, year))
+            seen_years.add(year)
+    if forecast:
+        labels.append((combined_count - 1, forecast[-1]["period"]))
+    for index, label in labels:
+        px = x(index)
+        draw.line((px, chart_bottom, px, chart_bottom + 7), fill="#6e8297", width=1)
+        tw = text_width(draw, label, font(14))
+        draw.text((px - tw / 2, chart_bottom + 14), label, fill="#5b7087", font=font(14))
 
-    for i in label_indices:
-        x, _ = points[i]
-        label = series[i]['period']
-        draw.line((x, chart_bottom, x, chart_bottom + 7), fill="#6e8297", width=1)
-        temp = Image.new('RGBA', (110, 32), (0, 0, 0, 0))
-        temp_draw = ImageDraw.Draw(temp)
-        temp_draw.text((0, 8), label, fill="#5b7087", font=font(14))
-        rotated = temp.rotate(55, expand=1)
-        image.paste(rotated, (int(x - 24), chart_bottom + 10), rotated)
+    # Footer panels kept fully inside the report.
+    footer_top, footer_bottom = 880, 1125
+    draw.rounded_rectangle((60, footer_top, width - 60, footer_bottom), radius=22, fill="#dde7f0", outline="#c2d0de", width=1)
+    divider_x = 790
+    draw.line((divider_x, footer_top + 22, divider_x, footer_bottom - 22), fill="#c0cfdd", width=2)
 
-    draw.text((chart_right - 95, chart_bottom + 140), "© AirSat", fill="#8ca0b5", font=font(16))
+    mean_value = sum(observed_values) / len(observed_values)
+    draw_rtl(draw, 740, footer_top + 24, "خلاصه آماری", selected_font=font(20, bold=True), fill=REPORT_INK)
+    draw_label_value_rtl(draw, 740, footer_top + 67, "بیشینه:", format_value(max(observed_values)), label_font=font(17), value_font=font(17))
+    draw_label_value_rtl(draw, 740, footer_top + 104, "کمینه:", format_value(min(observed_values)), label_font=font(17), value_font=font(17))
+    draw_label_value_rtl(draw, 740, footer_top + 141, "میانگین:", format_value(mean_value), label_font=font(17), value_font=font(17))
+    draw_ltr(draw, 92, footer_top + 188, f"y = {slope:.3e}x + {intercept:.3e}   |   R² = {r2:.3f}", selected_font=font(16), fill="#35516d")
 
-    mean_value = sum(values) / len(values)
-    min_value = min(values)
-    max_value = max(values)
-    latest = series[-1]
+    draw_rtl(draw, width - 92, footer_top + 24, "مشخصات گزارش", selected_font=font(20, bold=True), fill=REPORT_INK)
+    draw_label_value_rtl(draw, width - 92, footer_top + 67, "آلاینده:", row["pollutant"], label_font=font(17), value_font=font(17))
+    draw_label_value_rtl(draw, width - 92, footer_top + 104, "استان:", row.get("province_name"), label_font=font(17), value_font=font(17))
+    draw_label_value_rtl(draw, width - 92, footer_top + 141, "واحد:", cfg["unit"], label_font=font(17), value_font=font(17))
+    draw_label_value_rtl(draw, width - 92, footer_top + 178, "آخرین ماه:", series[-1]["period"], label_font=font(17), value_font=font(17))
 
-    footer_top = 895
-    draw.rounded_rectangle((64, footer_top, width - 64, height - 70), radius=20, fill="#dde7f0", outline="#c2d0de", width=1)
-    draw.text((88, footer_top + 28), display_text(f"Maximum: {format_value(max_value)}   |   Minimum: {format_value(min_value)}   |   Mean: {format_value(mean_value)}"), fill="#334b63", font=font(20))
-    draw.text((88, footer_top + 74), f"Source: {source}", fill="#60788f", font=font(16))
-    draw.text((88, footer_top + 112), f"Linear trend: y = {slope:.3e}x + {intercept:.3e}  |  R² = {r2:.3f}", fill="#334b63", font=font(18))
-
-    info_right_x = width - 570
-    draw.text((info_right_x, footer_top + 30), display_text(f"Pollutant: {row['pollutant']}   |   Province: {row.get('province_name')}"), fill="#1f3850", font=font(22, bold=True))
-    draw.text((info_right_x, footer_top + 78), display_text(f"Unit: {cfg['unit']}   |   Latest month: {latest['period']}"), fill="#35516d", font=font(18))
-    draw.text((info_right_x, footer_top + 114), display_text(f"n = {len(series)} monthly points   |   airsat.ir"), fill="#35516d", font=font(18))
-
-    draw.text((width / 2 - 230, height - 48), "© AirSat  •  Satellite-powered air monitoring for Iran  •  Sentinel-5P / TROPOMI  •  airsat.ir", fill="#6f8396", font=font(17))
-    image.save(output, 'PNG', optimize=True)
-
+    model_name = (forecast_model or {}).get("name_fa") or "پیش‌بینی در دسترس نیست"
+    draw_rtl(draw, width - 92, footer_top + 212, model_name, selected_font=font(15), fill="#6b4b21")
+    draw.text((70, height - 48), "© AirSat  •  Sentinel-5P / TROPOMI  •  Google Earth Engine  •  airsat.ir", fill="#6f8396", font=font(16))
+    image.save(output, "PNG", optimize=True)
 
 def write_shortcut(folder: Path) -> Path:
     windows_shortcut = folder / "AirSat.url"
@@ -658,22 +1071,38 @@ def format_value(value: float) -> str:
     return f"{value:.3e}".replace("e-0", "e-").replace("e+0", "e+")
 
 
-def draw_header(draw: ImageDraw.ImageDraw, width: int, title: str, generated_at: str) -> None:
-    header_top = 30
-    header_bottom = 165
-    # clean blue brand bar, with a reserved brand zone on the right.
-    draw.rounded_rectangle((34, header_top, width - 34, header_bottom), radius=28, fill="#16508f")
-    brand_x = width - 280
-    draw.text((72, header_top + 42), "Sentinel-5P / TROPOMI  •  Google Earth Engine  •  airsat.ir", fill="white", font=font(17))
-    draw.text((72, header_top + 82), generated_at, fill="#d9ecff", font=font(15))
-    draw.text((brand_x + 54, header_top + 24), "AirSat", fill="white", font=font(38, bold=True))
-    draw.text((brand_x + 56, header_top + 74), "Satellite-powered air monitoring for Iran", fill="#d9ecff", font=font(12))
-    # Title kept clearly away from the brand area.
-    title_text = display_text(title)
-    title_w = draw.textlength(title_text, font=font(24, bold=True))
-    title_x = max(420, brand_x - title_w - 28)
-    draw.text((title_x, header_top + 68), title_text, fill="white", font=font(24, bold=True))
+def draw_header(
+    image: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    width: int,
+    title_fa: str,
+    generated_at: str,
+) -> None:
+    header = (30, 28, width - 30, 174)
+    draw_gradient_round_rect(image, header, 30, REPORT_BLUE_TOP, REPORT_BLUE_BOTTOM)
 
+    # Fixed logo zone: the real AirSat logo is scaled, never clipped.
+    logo = load_brand_logo(325, 102)
+    if logo is not None:
+        logo_x = width - 68 - logo.width
+        logo_y = header[1] + (header[3] - header[1] - logo.height) // 2
+        image.paste(logo, (logo_x, logo_y), logo)
+    else:
+        draw.text((width - 300, 58), "AirSat", fill="white", font=font(42, bold=True))
+
+    draw_ltr(draw, 70, 67, "Sentinel-5P / TROPOMI  •  Google Earth Engine  •  airsat.ir", selected_font=font(16), fill="white")
+    draw_ltr(draw, 70, 111, generated_at, selected_font=font(14), fill="#d9ecff")
+
+    # Reserved title zone cannot collide with the logo or metadata.
+    title_left, title_right = 500, width - 410
+    draw_centered_rtl(
+        draw,
+        (title_left + title_right) / 2,
+        76,
+        title_fa,
+        selected_font=font(24, bold=True),
+        fill="white",
+    )
 
 def compute_linear_trend(values: list[float]) -> tuple[float, float, float]:
     n = len(values)
@@ -690,6 +1119,31 @@ def compute_linear_trend(values: list[float]) -> tuple[float, float, float]:
     return slope, intercept, r2
 
 
+def draw_color_legend(
+    image: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    box: tuple[int, int, int, int],
+    cfg: dict[str, Any],
+) -> None:
+    left, top, right, bottom = box
+    colors = [tuple(int(color[i:i+2], 16) for i in (0, 2, 4)) for color in cfg["palette"]]
+    gradient = Image.new("RGB", (right - left, bottom - top), colors[0])
+    pixels = gradient.load()
+    for x in range(gradient.width):
+        position = x / max(1, gradient.width - 1) * (len(colors) - 1)
+        index = min(len(colors) - 2, int(position))
+        ratio = position - index
+        color = tuple(round(colors[index][c] + (colors[index + 1][c] - colors[index][c]) * ratio) for c in range(3))
+        for y in range(gradient.height):
+            pixels[x, y] = color
+    image.paste(gradient, (left, top))
+    draw.rectangle(box, outline="#72869a", width=1)
+    draw.text((left, bottom + 8), format_value(cfg["min"]), fill="#4f6579", font=font(14))
+    max_label = format_value(cfg["max"])
+    max_width = text_width(draw, max_label, font(14))
+    draw.text((right - max_width, bottom + 8), max_label, fill="#4f6579", font=font(14))
+
+
 def compose_preview(
     raw_png: Path,
     output_png: Path,
@@ -697,58 +1151,77 @@ def compose_preview(
     cfg: dict[str, Any],
     start: str,
     end: str,
+    bbox: tuple[float, float, float, float],
 ) -> None:
-    raw = Image.open(raw_png).convert("RGBA")
-    width, height = 1600, 1080
+    width, height = 1600, 1200
     image = Image.new("RGB", (width, height), "#dfe7ef")
     draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((30, 26, width - 30, height - 26), radius=32, fill="#eef3f8")
 
-    draw.rounded_rectangle((34, 30, width - 34, height - 34), radius=30, fill="#eef3f8")
-    generated = datetime.now().strftime("%Y-%m-%d, %H:%M UTC")
-    title = f"Spatial map of {row['pollutant']} in {row.get('province_name')}"
-    draw_header(draw, width, title, generated)
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d، %H:%M UTC")
+    title = f"نقشه مکانی {POLLUTANT_FA[row['pollutant']]} در استان {row.get('province_name')}"
+    draw_header(image, draw, width, title, generated)
 
-    body = (64, 200, width - 64, 840)
-    draw.rounded_rectangle(body, radius=28, fill="#f8fbfd", outline="#c9d6e3", width=2)
+    body = (60, 200, width - 60, 870)
+    draw.rounded_rectangle(body, radius=28, fill="#fbfdff", outline=REPORT_LINE, width=2)
+    map_box = (92, 230, width - 92, 825)
+    map_width, map_height = map_box[2] - map_box[0], map_box[3] - map_box[1]
 
-    map_box = (115, 255, width - 115, 760)
-    box_w = map_box[2] - map_box[0]
-    box_h = map_box[3] - map_box[1]
-    raw_ratio = raw.width / raw.height
-    box_ratio = box_w / box_h
-    if raw_ratio > box_ratio:
-        new_w = box_w
-        new_h = round(box_w / raw_ratio)
-    else:
-        new_h = box_h
-        new_w = round(box_h * raw_ratio)
-    resized = raw.resize((new_w, new_h), Image.Resampling.LANCZOS)
-    offset_x = map_box[0] + (box_w - new_w) // 2
-    offset_y = map_box[1] + (box_h - new_h) // 2
-    draw.rounded_rectangle(map_box, radius=18, fill="white", outline="#d8e2eb", width=2)
-    image.paste(resized, (offset_x, offset_y), resized)
+    try:
+        basemap = build_osm_basemap(bbox, map_width, map_height)
+    except Exception as error:
+        print("OSM basemap fallback:", repr(error))
+        basemap = Image.new("RGB", (map_width, map_height), "#e8edf2")
+        fallback_draw = ImageDraw.Draw(basemap)
+        draw_centered_rtl(fallback_draw, map_width / 2, map_height / 2 - 14, "نقشه پایه موقتاً در دسترس نیست", selected_font=font(20), fill="#60788f")
 
-    footer_top = 865
-    draw.rounded_rectangle((64, footer_top, width - 64, height - 70), radius=20, fill="#dde7f0", outline="#c2d0de", width=1)
-    region = row.get('province_name')
-    left_lines = [
-        display_text(f"Pollutant: {row['pollutant']}   |   Region: {region}"),
-        display_text(f"Period: {row.get('period_key') or (start + ' to ' + end)}   |   Unit: {cfg['unit']}"),
-        display_text(f"Date range: {start}  →  {end}   |   airsat.ir"),
-    ]
-    right_lines = [
-        display_text(f"Nominal display range: {format_value(cfg['min'])}  to  {format_value(cfg['max'])}"),
-        display_text("Source: Sentinel-5P / TROPOMI | Google Earth Engine"),
-        display_text("Preview map packed with GeoTIFF export"),
-    ]
-    for idx, line in enumerate(left_lines):
-        draw.text((92, footer_top + 28 + idx * 38), line, fill="#28435d", font=font(20, bold=True) if idx == 0 else font(18))
-    for idx, line in enumerate(right_lines):
-        draw.text((900, footer_top + 28 + idx * 38), line, fill="#526b83", font=font(17))
+    raw = Image.open(raw_png).convert("RGBA").resize((map_width, map_height), Image.Resampling.LANCZOS)
+    alpha = raw.getchannel("A").point(lambda value: round(value * 0.85))
+    raw.putalpha(alpha)
+    composed = basemap.convert("RGBA")
+    composed.alpha_composite(raw)
 
-    draw.text((width / 2 - 230, height - 48), "© AirSat  •  Satellite-powered air monitoring for Iran  •  Sentinel-5P / TROPOMI  •  airsat.ir", fill="#6f8396", font=font(17))
-    image.save(output_png, 'PNG', optimize=True)
+    # Province boundary extracted from the overlay mask.
+    edge = alpha.filter(ImageFilter.FIND_EDGES).point(lambda value: 255 if value > 28 else 0)
+    boundary = Image.new("RGBA", raw.size, (15, 80, 145, 0))
+    boundary.putalpha(edge)
+    composed.alpha_composite(boundary)
 
+    image.paste(composed.convert("RGB"), (map_box[0], map_box[1]))
+    draw.rounded_rectangle(map_box, radius=18, outline="#b9c8d6", width=2)
+
+    # Map decorations and mandatory attribution.
+    draw.text((map_box[0] + 14, map_box[3] - 27), "© OpenStreetMap contributors", fill="#34495e", font=font(13))
+    draw.text((map_box[2] - 52, map_box[1] + 18), "N", fill="#153c60", font=font(18, bold=True))
+    draw.polygon([
+        (map_box[2] - 42, map_box[1] + 45),
+        (map_box[2] - 52, map_box[1] + 76),
+        (map_box[2] - 32, map_box[1] + 76),
+    ], fill="#153c60")
+
+    legend_box = (map_box[0] + 28, map_box[1] + 25, map_box[0] + 310, map_box[1] + 44)
+    draw_color_legend(image, draw, legend_box, cfg)
+    draw_rtl(draw, legend_box[2], legend_box[1] - 29, "راهنمای شدت آلاینده", selected_font=font(16, bold=True), fill="#28435d")
+
+    footer_top, footer_bottom = 892, 1125
+    draw.rounded_rectangle((60, footer_top, width - 60, footer_bottom), radius=22, fill="#dde7f0", outline="#c2d0de", width=1)
+    divider_x = 790
+    draw.line((divider_x, footer_top + 22, divider_x, footer_bottom - 22), fill="#c0cfdd", width=2)
+
+    draw_rtl(draw, 740, footer_top + 25, "مشخصات مکانی و زمانی", selected_font=font(20, bold=True), fill=REPORT_INK)
+    draw_label_value_rtl(draw, 740, footer_top + 70, "استان:", row.get("province_name"), label_font=font(17), value_font=font(17))
+    draw_label_value_rtl(draw, 740, footer_top + 108, "بازه:", period_fa(row.get("period_key"), start, end), label_font=font(17), value_font=font(17))
+    draw_label_value_rtl(draw, 740, footer_top + 146, "شروع:", start, label_font=font(17), value_font=font(17))
+    draw_label_value_rtl(draw, 740, footer_top + 184, "پایان:", end, label_font=font(17), value_font=font(17))
+
+    draw_rtl(draw, width - 92, footer_top + 25, "مشخصات داده", selected_font=font(20, bold=True), fill=REPORT_INK)
+    draw_label_value_rtl(draw, width - 92, footer_top + 70, "آلاینده:", row["pollutant"], label_font=font(17), value_font=font(17))
+    draw_label_value_rtl(draw, width - 92, footer_top + 108, "واحد:", cfg["unit"], label_font=font(17), value_font=font(17))
+    draw_label_value_rtl(draw, width - 92, footer_top + 146, "شفافیت لایه:", "85%", label_font=font(17), value_font=font(17))
+    draw_ltr(draw, 850, footer_top + 184, "Sentinel-5P / TROPOMI • Google Earth Engine", selected_font=font(15), fill="#526b83")
+
+    draw.text((70, height - 48), "© AirSat  •  OpenStreetMap contributors  •  airsat.ir", fill="#6f8396", font=font(16))
+    image.save(output_png, "PNG", optimize=True)
 
 def safe_filename(value: str) -> str:
     value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
@@ -769,6 +1242,203 @@ def upload_zip(path: Path, object_path: str) -> None:
     if not response.ok:
         raise RuntimeError(f"Storage upload failed: {supabase_error(response)}")
 
+
+
+def get_site_settings(keys: list[str]) -> dict[str, Any]:
+    if not keys:
+        return {}
+    url = required("SUPABASE_URL") + "/rest/v1/site_settings"
+    response = requests.get(
+        url,
+        params={"key": f"in.({','.join(keys)})", "select": "key,value"},
+        headers=service_headers(),
+        timeout=30,
+    )
+    if not response.ok:
+        print("Site settings unavailable:", supabase_error(response))
+        return {}
+    return {item["key"]: item.get("value") for item in response.json()}
+
+
+def setting_bool(settings: dict[str, Any], key: str, default: bool = False) -> bool:
+    value = settings.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, dict) and "enabled" in value:
+        return bool(value["enabled"])
+    return str(value).lower() in {"1", "true", "yes", "on"}
+
+
+def get_profile(user_id: str) -> dict[str, Any]:
+    url = required("SUPABASE_URL") + "/rest/v1/profiles"
+    response = requests.get(
+        url,
+        params={"id": f"eq.{user_id}", "select": "*", "limit": "1"},
+        headers=service_headers(),
+        timeout=30,
+    )
+    return response.json()[0] if response.ok and response.json() else {}
+
+
+def create_signed_download_url(object_path: str, expires_in: int = 86400) -> str | None:
+    bucket = os.getenv("EXPORT_BUCKET", "airsat-exports")
+    encoded = "/".join(quote(segment, safe="") for segment in object_path.split("/"))
+    url = f"{required('SUPABASE_URL')}/storage/v1/object/sign/{bucket}/{encoded}"
+    response = requests.post(
+        url,
+        headers=service_headers(),
+        json={"expiresIn": expires_in},
+        timeout=30,
+    )
+    if not response.ok:
+        print("Signed URL failed:", supabase_error(response))
+        return None
+    signed = response.json().get("signedURL") or response.json().get("signedUrl")
+    if not signed:
+        return None
+    if signed.startswith("http"):
+        return signed
+    return required("SUPABASE_URL").rstrip("/") + "/storage/v1" + signed
+
+
+def ready_email_html(row: dict[str, Any], download_url: str, expiry_hours: int) -> str:
+    province = row.get("province_name") or "استان انتخاب‌شده"
+    pollutant = row.get("pollutant") or ""
+    return f"""<!doctype html>
+<html lang="fa" dir="rtl"><head><meta charset="utf-8"></head>
+<body style="margin:0;background:#eef3f8;font-family:Tahoma,Arial,sans-serif;color:#18344f">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#eef3f8;padding:28px 12px"><tr><td align="center">
+<table role="presentation" width="620" cellspacing="0" cellpadding="0" style="max-width:620px;background:#fff;border-radius:20px;overflow:hidden;border:1px solid #d4e0eb">
+<tr><td style="background:linear-gradient(135deg,#0f4f91,#1768ad);padding:26px 32px;color:#fff">
+<div style="font-size:34px;font-weight:700;direction:ltr;text-align:right">AirSat</div>
+<div style="font-size:14px;color:#d9ecff;margin-top:4px">سامانه پایش ماهواره‌ای آلودگی هوای ایران</div>
+</td></tr>
+<tr><td style="padding:34px 34px 20px">
+<h2 style="margin:0 0 18px;font-size:22px">فایل درخواست شما آماده است</h2>
+<p style="line-height:2;margin:0 0 18px">خروجی <strong>{pollutant}</strong> برای <strong>{province}</strong> آماده شده است.</p>
+<table width="100%" style="background:#f4f8fb;border-radius:12px;padding:14px;line-height:2">
+<tr><td>آلاینده</td><td align="left" dir="ltr">{pollutant}</td></tr>
+<tr><td>استان</td><td align="left">{province}</td></tr>
+<tr><td>اعتبار لینک</td><td align="left">{expiry_hours} ساعت</td></tr>
+</table>
+<div style="text-align:center;margin:28px 0"><a href="{download_url}" style="display:inline-block;background:#0f5fae;color:#fff;text-decoration:none;padding:14px 28px;border-radius:11px;font-weight:700">دانلود بسته AirSat</a></div>
+<p style="font-size:13px;color:#6b7f92;line-height:1.9">این ایمیل با قالب اختصاصی AirSat ارسال شده است. در صورت پیوست‌بودن فایل، نسخه پیوست و لینک دانلود هر دو در دسترس‌اند.</p>
+</td></tr>
+<tr><td style="padding:18px 32px;background:#e6eef5;color:#60788f;font-size:12px;text-align:center">© AirSat • Sentinel-5P / TROPOMI • airsat.ir</td></tr>
+</table></td></tr></table></body></html>"""
+
+
+def send_ready_email(
+    recipient: str,
+    row: dict[str, Any],
+    zip_path: Path,
+    download_url: str,
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    api_key = os.getenv("RESEND_API_KEY", "").strip()
+    sender = os.getenv("AIRSAT_EMAIL_FROM", "").strip()
+    if not api_key or not sender:
+        return {"status": "skipped", "reason": "email-secrets-missing"}
+    expiry_hours = int(settings.get("notifications.download_expiry_hours") or 24)
+    subject_value = settings.get("notifications.email_subject_fa")
+    subject = str(subject_value if isinstance(subject_value, str) else "فایل AirSat شما آماده است")
+    payload: dict[str, Any] = {
+        "from": sender,
+        "to": [recipient],
+        "subject": subject,
+        "html": ready_email_html(row, download_url, expiry_hours),
+    }
+    reply_to = os.getenv("AIRSAT_EMAIL_REPLY_TO", "").strip()
+    if reply_to:
+        payload["reply_to"] = reply_to
+
+    attach = setting_bool(settings, "notifications.email_attach_zip", True)
+    # Resend's total attachment limit is after Base64 encoding. Stay safely below it.
+    if attach and zip_path.stat().st_size <= 28 * 1024 * 1024:
+        payload["attachments"] = [{
+            "filename": zip_path.name,
+            "content": base64.b64encode(zip_path.read_bytes()).decode("ascii"),
+        }]
+
+    response = requests.post(
+        "https://api.resend.com/emails",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=120,
+    )
+    if not response.ok:
+        return {"status": "failed", "error": response.text[:800]}
+    return {"status": "sent", "provider": "resend", "id": response.json().get("id"), "attached": "attachments" in payload}
+
+
+def normalize_iran_mobile(value: Any) -> str | None:
+    digits = re.sub(r"\D", "", str(value or ""))
+    if digits.startswith("0098"):
+        digits = digits[4:]
+    elif digits.startswith("98"):
+        digits = digits[2:]
+    if digits.startswith("0"):
+        digits = digits[1:]
+    return digits if re.fullmatch(r"9\d{9}", digits) else None
+
+
+def send_ready_sms(phone: str, row: dict[str, Any]) -> dict[str, Any]:
+    api_key = os.getenv("SMSIR_API_KEY", "").strip()
+    template_id = os.getenv("SMSIR_READY_TEMPLATE_ID", "").strip()
+    mobile = normalize_iran_mobile(phone)
+    if not api_key or not template_id or not mobile:
+        return {"status": "skipped", "reason": "sms-config-or-phone-missing"}
+    response = requests.post(
+        "https://api.sms.ir/v1/send/verify",
+        headers={"X-API-KEY": api_key, "Content-Type": "application/json", "Accept": "application/json"},
+        json={
+            "mobile": mobile,
+            "templateId": int(template_id),
+            "parameters": [
+                {"name": "POLLUTANT", "value": str(row.get("pollutant") or "")},
+                {"name": "REGION", "value": str(row.get("province_name") or "")},
+            ],
+        },
+        timeout=45,
+    )
+    if not response.ok:
+        return {"status": "failed", "error": response.text[:800]}
+    return {"status": "sent", "provider": "sms.ir", "response": response.json()}
+
+
+def send_ready_notifications(
+    row: dict[str, Any],
+    zip_path: Path,
+    object_path: str,
+) -> dict[str, Any]:
+    keys = [
+        "features.email_notifications_enabled",
+        "features.sms_notifications_enabled",
+        "notifications.email_attach_zip",
+        "notifications.download_expiry_hours",
+        "notifications.email_subject_fa",
+    ]
+    settings = get_site_settings(keys)
+    profile = get_profile(str(row["user_id"]))
+    metadata = row.get("metadata") or {}
+    results: dict[str, Any] = {}
+    expiry_hours = int(settings.get("notifications.download_expiry_hours") or 24)
+    signed_url = create_signed_download_url(object_path, expiry_hours * 3600)
+
+    email = profile.get("email") or metadata.get("user_email")
+    email_allowed = profile.get("email_notifications", True)
+    if setting_bool(settings, "features.email_notifications_enabled", False) and email and email_allowed and signed_url:
+        results["email"] = send_ready_email(email, row, zip_path, signed_url, settings)
+    else:
+        results["email"] = {"status": "skipped"}
+
+    phone = profile.get("phone") or metadata.get("user_phone")
+    sms_allowed = profile.get("sms_notifications", True)
+    if setting_bool(settings, "features.sms_notifications_enabled", False) and phone and sms_allowed:
+        results["sms"] = send_ready_sms(phone, row)
+    else:
+        results["sms"] = {"status": "skipped"}
+    return results
 
 def main() -> None:
     request_id = required("REQUEST_ID")
@@ -814,6 +1484,8 @@ def main() -> None:
         start, end, ee_end = resolve_dates(row)
         init_earth_engine()
         region = build_region(row)
+        render_bbox = region_bbox(region)
+        render_region = ee.Geometry.Rectangle(list(render_bbox), proj=None, geodesic=False)
 
         collection = (
             ee.ImageCollection(cfg["collection"])
@@ -865,10 +1537,14 @@ def main() -> None:
                 palette=cfg["palette"],
             )
             thumbnail_url = visual.getThumbURL(
-                {"region": region, "dimensions": 1400, "format": "png"}
+                {
+                    "region": render_region,
+                    "dimensions": "1416x595",
+                    "format": "png",
+                }
             )
             download_file(thumbnail_url, raw_preview)
-            compose_preview(raw_preview, preview, row, cfg, start, end)
+            compose_preview(raw_preview, preview, row, cfg, start, end, render_bbox)
 
             series = []
             series_source = "not-applicable"
@@ -879,6 +1555,11 @@ def main() -> None:
                     series, series_source = compute_region_timeseries(cfg, region)
 
                 if series:
+                    forecast_model = lightweight_seasonal_forecast(
+                        series,
+                        row["pollutant"],
+                        horizon=6,
+                    )
                     write_timeseries_files(
                         series,
                         timeseries_csv,
@@ -886,6 +1567,7 @@ def main() -> None:
                         row,
                         cfg,
                         series_source,
+                        forecast_model,
                     )
                     draw_timeseries_chart(
                         series,
@@ -893,6 +1575,7 @@ def main() -> None:
                         row,
                         cfg,
                         series_source,
+                        forecast_model,
                     )
 
             windows_shortcut = write_shortcut(folder)
@@ -944,7 +1627,10 @@ def main() -> None:
             object_path = f"{row['user_id']}/{request_id}/{output_zip.name}"
             upload_zip(output_zip, object_path)
 
-            expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+            notification_settings = get_site_settings(["notifications.download_expiry_hours"])
+            expiry_hours = int(notification_settings.get("notifications.download_expiry_hours") or 24)
+            expires_at = datetime.now(timezone.utc) + timedelta(hours=expiry_hours)
+            notification_results = send_ready_notifications(row, output_zip, object_path)
             update_request(
                 request_id,
                 {
@@ -952,7 +1638,8 @@ def main() -> None:
                     "object_path": object_path,
                     "file_name": output_zip.name,
                     "expires_at": expires_at.isoformat(),
-                    "message": "بسته شامل GeoTIFF، نقشه و سری زمانی در قالب گزارش AirSat و یک میانبر به سایت است؛ تا ۲۴ ساعت قابل دانلود خواهد بود.",
+                    "notification_results": notification_results,
+                    "message": f"بسته شامل GeoTIFF، نقشه OSM با لایه ۸۵٪ و سری زمانی همراه پیش‌بینی است؛ تا {expiry_hours} ساعت قابل دانلود خواهد بود.",
                     "error": None,
                 },
             )
