@@ -2,7 +2,7 @@ name: Recover Pending AirSat Requests
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -54,8 +54,8 @@ jobs:
           AIRSAT_AUTO_ROOT: ${{ github.workspace }}/target
           AIRSAT_FONT_DIR: /usr/local/share/fonts/airsat
           AIRSAT_TIMESERIES_FALLBACK: "true"
-          PENDING_MIN_AGE_MINUTES: "10"
-          MAX_PENDING_REQUESTS: "2"
+          PENDING_MIN_AGE_MINUTES: "2"
+          MAX_PENDING_REQUESTS: "5"
           EE_SERVICE_ACCOUNT_JSON: ${{ secrets.EE_SERVICE_ACCOUNT_JSON }}
           EE_PROJECT: ${{ secrets.EE_PROJECT }}
           EE_PROVINCES_ASSET: ${{ secrets.EE_PROVINCES_ASSET }}
