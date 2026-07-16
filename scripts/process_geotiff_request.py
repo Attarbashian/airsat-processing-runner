@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AirSat Export Processor v3.2: create GeoTIFF and polished branded outputs."""
+"""AirSat Export Processor v3.3: create GeoTIFF and polished branded outputs."""
 
 from __future__ import annotations
 
@@ -135,7 +135,7 @@ ZIP_CONTENT_LABELS_FA = {
 }
 
 OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
-OSM_USER_AGENT = "AirSat/3.2 (https://airsat.ir; info@airsat.ir)"
+OSM_USER_AGENT = "AirSat/3.3 (https://airsat.ir; airsat.iran@gmail.com)"
 REPORT_BLUE_TOP = "#0f4f91"
 REPORT_BLUE_BOTTOM = "#1768ad"
 REPORT_INK = "#18344f"
@@ -362,7 +362,7 @@ def font(size: int, bold: bool = False) -> ImageFont.ImageFont:
     ]
     for candidate in candidates:
         if candidate.exists():
-            return ImageFont.truetype(str(candidate), size=size)
+            return ImageFont.truetype(str(candidate), size=size, layout_engine=ImageFont.Layout.RAQM)
 
     raise RuntimeError(
         "Vazir font was not installed. Check the Install Vazir font workflow step."
@@ -371,20 +371,30 @@ def font(size: int, bold: bool = False) -> ImageFont.ImageFont:
 
 
 def shape_fa(value: Any) -> str:
-    """Shape a Persian-only string for Pillow without mixing LTR fragments."""
-    value = str(value or "")
-    if arabic_reshaper is not None and get_display is not None:
-        return get_display(arabic_reshaper.reshape(value))
-    return value
+    """Keep logical Unicode order; Pillow RAQM performs Persian shaping."""
+    return str(value or "")
 
 
 def display_text(value: Any) -> str:
-    # Compatibility alias. Mixed Persian/Latin text must not be passed here.
-    return shape_fa(value)
+    return str(value or "")
 
 
-def text_width(draw: ImageDraw.ImageDraw, value: str, selected_font: ImageFont.ImageFont) -> float:
-    return float(draw.textlength(value, font=selected_font))
+def has_persian(value: Any) -> bool:
+    return bool(re.search(r"[\u0600-\u06FF]", str(value or "")))
+
+
+def text_width(
+    draw: ImageDraw.ImageDraw,
+    value: Any,
+    selected_font: ImageFont.ImageFont,
+    *,
+    rtl: bool | None = None,
+) -> float:
+    text = str(value or "")
+    if rtl is None:
+        rtl = has_persian(text)
+    kwargs = {"direction": "rtl", "language": "fa"} if rtl else {"direction": "ltr"}
+    return float(draw.textlength(text, font=selected_font, **kwargs))
 
 
 def draw_rtl(
@@ -396,10 +406,17 @@ def draw_rtl(
     selected_font: ImageFont.ImageFont,
     fill: str,
 ) -> float:
-    shaped = shape_fa(value)
-    width = text_width(draw, shaped, selected_font)
-    draw.text((right_x - width, y), shaped, font=selected_font, fill=fill)
-    return width
+    text = str(value or "")
+    draw.text(
+        (right_x, y),
+        text,
+        font=selected_font,
+        fill=fill,
+        anchor="rt",
+        direction="rtl",
+        language="fa",
+    )
+    return text_width(draw, text, selected_font, rtl=True)
 
 
 def draw_centered_rtl(
@@ -411,9 +428,15 @@ def draw_centered_rtl(
     selected_font: ImageFont.ImageFont,
     fill: str,
 ) -> None:
-    shaped = shape_fa(value)
-    width = text_width(draw, shaped, selected_font)
-    draw.text((center_x - width / 2, y), shaped, font=selected_font, fill=fill)
+    draw.text(
+        (center_x, y),
+        str(value or ""),
+        font=selected_font,
+        fill=fill,
+        anchor="mt",
+        direction="rtl",
+        language="fa",
+    )
 
 
 def draw_ltr(
@@ -424,10 +447,18 @@ def draw_ltr(
     *,
     selected_font: ImageFont.ImageFont,
     fill: str,
+    anchor: str = "lt",
 ) -> float:
     text = str(value or "")
-    draw.text((x, y), text, font=selected_font, fill=fill)
-    return text_width(draw, text, selected_font)
+    draw.text(
+        (x, y),
+        text,
+        font=selected_font,
+        fill=fill,
+        anchor=anchor,
+        direction="ltr",
+    )
+    return text_width(draw, text, selected_font, rtl=False)
 
 
 def draw_label_value_rtl(
@@ -451,38 +482,104 @@ def draw_label_value_rtl(
         fill=fill,
     )
     value = str(value_ltr or "")
-    if re.search(r"[\u0600-\u06FF]", value):
-        value = shape_fa(value)
-    value_width = text_width(draw, value, value_font)
-    draw.text(
-        (right_x - label_width - gap - value_width, y),
-        value,
-        font=value_font,
-        fill=fill,
+    value_right = right_x - label_width - gap
+    if has_persian(value):
+        draw.text(
+            (value_right, y),
+            value,
+            font=value_font,
+            fill=fill,
+            anchor="rt",
+            direction="rtl",
+            language="fa",
+        )
+    else:
+        draw.text(
+            (value_right, y),
+            value,
+            font=value_font,
+            fill=fill,
+            anchor="rt",
+            direction="ltr",
+        )
+
+
+def persian_digits(value: Any) -> str:
+    return str(value).translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
+
+
+def gregorian_to_jalali(gy: int, gm: int, gd: int) -> tuple[int, int, int]:
+    g_days = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    gy2 = gy + 1 if gm > 2 else gy
+    days = (
+        355666
+        + 365 * gy
+        + (gy2 + 3) // 4
+        - (gy2 + 99) // 100
+        + (gy2 + 399) // 400
+        + gd
+        + g_days[gm - 1]
     )
+    jy = -1595 + 33 * (days // 12053)
+    days %= 12053
+    jy += 4 * (days // 1461)
+    days %= 1461
+    if days > 365:
+        jy += (days - 1) // 365
+        days = (days - 1) % 365
+    if days < 186:
+        jm = 1 + days // 31
+        jd = 1 + days % 31
+    else:
+        jm = 7 + (days - 186) // 30
+        jd = 1 + (days - 186) % 30
+    return jy, jm, jd
+
+
+def generated_time_fa() -> str:
+    now = datetime.now(timezone(timedelta(hours=3, minutes=30)))
+    jy, jm, jd = gregorian_to_jalali(now.year, now.month, now.day)
+    return persian_digits(f"{jy}/{jm}/{jd}، {now:%H:%M}")
 
 
 def draw_gradient_round_rect(
     image: Image.Image,
     box: tuple[int, int, int, int],
     radius: int,
-    top_color: str,
-    bottom_color: str,
+    left_color: str,
+    right_color: str,
 ) -> None:
     left, top, right, bottom = box
     width, height = right - left, bottom - top
-    gradient = Image.new("RGB", (width, height), top_color)
-    top_rgb = tuple(int(top_color[i:i+2], 16) for i in (1, 3, 5))
-    bottom_rgb = tuple(int(bottom_color[i:i+2], 16) for i in (1, 3, 5))
+    left_rgb = tuple(int(left_color[i:i+2], 16) for i in (1, 3, 5))
+    right_rgb = tuple(int(right_color[i:i+2], 16) for i in (1, 3, 5))
+    gradient = Image.new("RGB", (width, height), left_color)
     pixels = gradient.load()
-    for y in range(height):
-        ratio = y / max(1, height - 1)
-        color = tuple(round(a + (b - a) * ratio) for a, b in zip(top_rgb, bottom_rgb))
-        for x in range(width):
+    for x in range(width):
+        ratio = x / max(1, width - 1)
+        color = tuple(round(a + (b - a) * ratio) for a, b in zip(left_rgb, right_rgb))
+        for y in range(height):
             pixels[x, y] = color
     mask = Image.new("L", (width, height), 0)
-    ImageDraw.Draw(mask).rounded_rectangle((0, 0, width, height), radius=radius, fill=255)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, width - 1, height - 1), radius=radius, fill=255)
     image.paste(gradient, (left, top), mask)
+
+
+def draw_report_background(width: int = 1800, height: int = 1260) -> tuple[Image.Image, ImageDraw.ImageDraw]:
+    image = Image.new("RGB", (width, height), "#edf6fd")
+    bg = Image.new("RGB", (width, height), "#edf6fd")
+    pixels = bg.load()
+    a = (237, 246, 253)
+    b = (248, 251, 254)
+    for x in range(width):
+        ratio = x / max(1, width - 1)
+        color = tuple(round(v1 + (v2 - v1) * ratio) for v1, v2 in zip(a, b))
+        for y in range(height):
+            pixels[x, y] = color
+    image.paste(bg)
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((72, 72, width - 72, height - 72), radius=28, fill="#ffffff", outline="#d6e5f1", width=2)
+    return image, draw
 
 
 def load_brand_logo(max_width: int = 330, max_height: int = 105) -> Image.Image | None:
@@ -938,18 +1035,20 @@ def draw_timeseries_chart(
     source: str,
     forecast_model: dict[str, Any] | None,
 ) -> None:
-    width, height = 1600, 1200
-    image = Image.new("RGB", (width, height), "#dfe7ef")
-    draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((30, 26, width - 30, height - 26), radius=32, fill="#eef3f8")
+    width, height = 1800, 1260
+    image, draw = draw_report_background(width, height)
+    pollutant_fa = POLLUTANT_FA[row["pollutant"]]
+    province = row.get("province_name") or "کل کشور"
+    title = f"سری زمانی ماهانه {pollutant_fa} در استان {province}"
+    draw_header(image, draw, width, title, generated_time_fa())
 
-    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d، %H:%M UTC")
-    title = f"سری زمانی ماهانه {POLLUTANT_FA[row['pollutant']]} در استان {row.get('province_name')}"
-    draw_header(image, draw, width, title, generated)
+    chart_x, chart_y, chart_w, chart_h = 106, 260, 1588, 710
+    draw.rounded_rectangle((chart_x, chart_y, chart_x + chart_w, chart_y + chart_h), radius=22, fill="#fbfdff", outline="#d8e6f1", width=2)
 
-    body = (60, 200, width - 60, 858)
-    draw.rounded_rectangle(body, radius=28, fill="#fbfdff", outline=REPORT_LINE, width=2)
-    chart_left, chart_top, chart_right, chart_bottom = 185, 315, width - 105, 760
+    content_left, content_top = chart_x + 38, chart_y + 28
+    content_right, content_bottom = chart_x + chart_w - 38, chart_y + chart_h - 28
+    plot_left, plot_top = content_left + 110, content_top + 120
+    plot_right, plot_bottom = content_right - 35, content_bottom - 86
 
     observed_values = [float(item["value"]) for item in series]
     forecast = (forecast_model or {}).get("forecast", [])
@@ -960,77 +1059,59 @@ def draw_timeseries_chart(
     padding = (maximum - minimum) * 0.10 if not math.isclose(minimum, maximum) else abs(minimum) * 0.08 or 1.0
     y_min, y_max = minimum - padding, maximum + padding
 
-    # Legend with pure Persian labels.
-    legend_y = 252
+    legend_y = content_top + 45
     legend_items = [
-        ("#135fb3", None, "مشاهده‌شده"),
-        ("#8ca9c8", "5 5", "روند خطی"),
-        ("#ef8b2c", "8 5", "پیش‌بینی شش‌ماهه"),
+        ("#135fb3", "مشاهده‌شده"),
+        ("#8ca9c8", "روند"),
+        ("#ef8b2c", "پیش‌بینی"),
     ]
-    legend_x = 1080
-    for color, dash, label in legend_items:
-        draw.line((legend_x, legend_y, legend_x + 42, legend_y), fill=color, width=4)
-        draw_rtl(draw, legend_x - 10, legend_y - 14, label, selected_font=font(17), fill="#425b76")
-        legend_x -= 220
+    legend_centers = [content_left + 360, content_left + 730, content_left + 1080]
+    for (color, label), center in zip(legend_items, legend_centers):
+        draw.line((center - 85, legend_y + 10, center - 30, legend_y + 10), fill=color, width=5)
+        draw_rtl(draw, center + 70, legend_y - 4, label, selected_font=font(18), fill="#536a80")
 
-    # Grid and y-axis labels.
     for step in range(6):
-        y = chart_top + (chart_bottom - chart_top) * step / 5
+        y = plot_top + (plot_bottom - plot_top) * step / 5
         value = y_max - (y_max - y_min) * step / 5
-        draw.line((chart_left, y, chart_right, y), fill="#d7e2ee", width=1)
+        draw.line((plot_left, y, plot_right, y), fill="#d7e2ee", width=1)
         label = format_value(value)
-        tw = text_width(draw, label, font(16))
-        draw.text((chart_left - tw - 14, y - 10), label, fill="#5d748c", font=font(16))
+        draw_ltr(draw, plot_left - 18, y - 10, label, selected_font=font(16), fill="#5d748c", anchor="rt")
 
     combined_count = len(series) + len(forecast)
-    x = lambda index: chart_left + (chart_right - chart_left) * index / max(1, combined_count - 1)
-    y_of = lambda value: chart_bottom - (float(value) - y_min) * (chart_bottom - chart_top) / max(1e-18, y_max - y_min)
+    x_of = lambda index: plot_left + (plot_right - plot_left) * index / max(1, combined_count - 1)
+    y_of = lambda value: plot_bottom - (float(value) - y_min) * (plot_bottom - plot_top) / max(1e-18, y_max - y_min)
 
-    observed_points = [(x(index), y_of(item["value"])) for index, item in enumerate(series)]
+    observed_points = [(x_of(index), y_of(item["value"])) for index, item in enumerate(series)]
     if len(observed_points) > 1:
-        draw.line(observed_points, fill="#135fb3", width=5)
-    for px, py in observed_points:
-        draw.ellipse((px - 3.5, py - 3.5, px + 3.5, py + 3.5), fill="#135fb3")
+        draw.line(observed_points, fill="#135fb3", width=6, joint="curve")
+    for px, py_ in observed_points:
+        draw.ellipse((px - 4, py_ - 4, px + 4, py_ + 4), fill="#135fb3")
 
     slope, intercept, r2 = compute_linear_trend(observed_values)
-    trend_points = [
-        (x(index), y_of(slope * index + intercept))
-        for index in range(len(series))
-    ]
+    trend_points = [(x_of(index), y_of(slope * index + intercept)) for index in range(len(series))]
     if len(trend_points) > 1:
         draw.line(trend_points, fill="#8ca9c8", width=3)
 
     if forecast:
-        upper = [(x(len(series) + index), y_of(item["high"])) for index, item in enumerate(forecast)]
-        lower = [(x(len(series) + index), y_of(item["low"])) for index, item in enumerate(forecast)]
-        band = upper + list(reversed(lower))
+        upper = [(x_of(len(series) + index), y_of(item["high"])) for index, item in enumerate(forecast)]
+        lower = [(x_of(len(series) + index), y_of(item["low"])) for index, item in enumerate(forecast)]
         band_layer = Image.new("RGBA", image.size, (0, 0, 0, 0))
-        ImageDraw.Draw(band_layer).polygon(band, fill=(239, 139, 44, 45))
-        image.alpha_composite(band_layer) if image.mode == "RGBA" else image.paste(band_layer, (0, 0), band_layer)
-        forecast_points = [(x(len(series) + index), y_of(item["value"])) for index, item in enumerate(forecast)]
+        ImageDraw.Draw(band_layer).polygon(upper + list(reversed(lower)), fill=(239, 139, 44, 42))
+        image.paste(band_layer, (0, 0), band_layer)
+        draw = ImageDraw.Draw(image)
+        forecast_points = [(x_of(len(series) + index), y_of(item["value"])) for index, item in enumerate(forecast)]
         path = [observed_points[-1], *forecast_points]
         for index in range(len(path) - 1):
-            # Dashed orange forecast line.
             x1, y1 = path[index]
             x2, y2 = path[index + 1]
-            segments = 14
+            segments = 16
             for segment in range(0, segments, 2):
                 a = segment / segments
                 b = min(1.0, (segment + 1) / segments)
-                draw.line(
-                    (
-                        x1 + (x2 - x1) * a,
-                        y1 + (y2 - y1) * a,
-                        x1 + (x2 - x1) * b,
-                        y1 + (y2 - y1) * b,
-                    ),
-                    fill="#ef8b2c",
-                    width=4,
-                )
-        for px, py in forecast_points:
-            draw.ellipse((px - 4, py - 4, px + 4, py + 4), fill="#ef8b2c")
+                draw.line((x1 + (x2 - x1) * a, y1 + (y2 - y1) * a, x1 + (x2 - x1) * b, y1 + (y2 - y1) * b), fill="#ef8b2c", width=5)
+        for px, py_ in forecast_points:
+            draw.ellipse((px - 5, py_ - 5, px + 5, py_ + 5), fill="#ef8b2c")
 
-    # X-axis: annual labels plus the final forecast month.
     labels: list[tuple[int, str]] = []
     seen_years: set[str] = set()
     for index, item in enumerate(series):
@@ -1041,34 +1122,33 @@ def draw_timeseries_chart(
     if forecast:
         labels.append((combined_count - 1, forecast[-1]["period"]))
     for index, label in labels:
-        px = x(index)
-        draw.line((px, chart_bottom, px, chart_bottom + 7), fill="#6e8297", width=1)
-        tw = text_width(draw, label, font(14))
-        draw.text((px - tw / 2, chart_bottom + 14), label, fill="#5b7087", font=font(14))
+        px = x_of(index)
+        draw.line((px, plot_bottom, px, plot_bottom + 8), fill="#6e8297", width=1)
+        draw_ltr(draw, px, plot_bottom + 16, label, selected_font=font(15), fill="#5b7087", anchor="mt")
 
-    # Footer panels kept fully inside the report.
-    footer_top, footer_bottom = 880, 1125
-    draw.rounded_rectangle((60, footer_top, width - 60, footer_bottom), radius=22, fill="#dde7f0", outline="#c2d0de", width=1)
-    divider_x = 790
-    draw.line((divider_x, footer_top + 22, divider_x, footer_bottom - 22), fill="#c0cfdd", width=2)
+    draw_ltr(draw, content_right - 10, content_bottom - 25, "© AirSat", selected_font=font(18), fill="#93a8bd", anchor="rt")
+
+    meta_y, meta_h = 994, 188
+    draw.rounded_rectangle((chart_x, meta_y, chart_x + chart_w, meta_y + meta_h), radius=20, fill="#edf5fb", outline="#d7e6f1", width=2)
 
     mean_value = sum(observed_values) / len(observed_values)
-    draw_rtl(draw, 740, footer_top + 24, "خلاصه آماری", selected_font=font(20, bold=True), fill=REPORT_INK)
-    draw_label_value_rtl(draw, 740, footer_top + 67, "بیشینه:", format_value(max(observed_values)), label_font=font(17), value_font=font(17))
-    draw_label_value_rtl(draw, 740, footer_top + 104, "کمینه:", format_value(min(observed_values)), label_font=font(17), value_font=font(17))
-    draw_label_value_rtl(draw, 740, footer_top + 141, "میانگین:", format_value(mean_value), label_font=font(17), value_font=font(17))
-    draw_ltr(draw, 92, footer_top + 188, f"y = {slope:.3e}x + {intercept:.3e}   |   R² = {r2:.3f}", selected_font=font(16), fill="#35516d")
+    right_x, left_x = width - 130, 130
+    draw_rtl(draw, right_x, meta_y + 28, f"آلاینده: {pollutant_fa}   |   استان: {province}", selected_font=font(20, bold=True), fill="#17324d")
+    draw_label_value_rtl(draw, right_x, meta_y + 68, "واحد:", cfg["unit"], label_font=font(18), value_font=font(18), fill="#405a72")
+    draw_label_value_rtl(draw, right_x - 300, meta_y + 68, "بازه:", period_fa(row.get("period_key"), series[0]["period"], series[-1]["period"]), label_font=font(18), value_font=font(18), fill="#405a72")
+    draw_ltr(draw, right_x, meta_y + 108, f"Start: {series[0]['period']}   |   End: {series[-1]['period']}   |   n = {len(series)}", selected_font=font(17), fill="#405a72", anchor="rt")
 
-    draw_rtl(draw, width - 92, footer_top + 24, "مشخصات گزارش", selected_font=font(20, bold=True), fill=REPORT_INK)
-    draw_label_value_rtl(draw, width - 92, footer_top + 67, "آلاینده:", row["pollutant"], label_font=font(17), value_font=font(17))
-    draw_label_value_rtl(draw, width - 92, footer_top + 104, "استان:", row.get("province_name"), label_font=font(17), value_font=font(17))
-    draw_label_value_rtl(draw, width - 92, footer_top + 141, "واحد:", cfg["unit"], label_font=font(17), value_font=font(17))
-    draw_label_value_rtl(draw, width - 92, footer_top + 178, "آخرین ماه:", series[-1]["period"], label_font=font(17), value_font=font(17))
-
+    draw_rtl(draw, left_x + 600, meta_y + 28, "خلاصه آماری", selected_font=font(20, bold=True), fill="#17324d")
+    draw_ltr(draw, left_x, meta_y + 68, f"Mean: {format_value(mean_value)}   |   Min: {format_value(min(observed_values))}   |   Max: {format_value(max(observed_values))}", selected_font=font(17), fill="#405a72")
+    draw_ltr(draw, left_x, meta_y + 108, f"Source: {source}", selected_font=font(15), fill="#64748b")
+    draw_ltr(draw, left_x, meta_y + 142, f"y = {slope:.3e}x + {intercept:.3e}   |   R² = {r2:.3f}", selected_font=font(16), fill="#36536d")
     model_name = (forecast_model or {}).get("name_fa") or "پیش‌بینی در دسترس نیست"
-    draw_rtl(draw, width - 92, footer_top + 212, model_name, selected_font=font(15), fill="#6b4b21")
-    draw.text((70, height - 48), "© AirSat  •  Sentinel-5P / TROPOMI  •  Google Earth Engine  •  airsat.ir", fill="#6f8396", font=font(16))
+    draw_rtl(draw, right_x, meta_y + 142, model_name, selected_font=font(15), fill="#6b4b21")
+
+    draw.rectangle((72, 1126, width - 72, 1188), fill="#f5f9fc")
+    draw_ltr(draw, width / 2, 1147, "© AirSat  •  Satellite-powered air monitoring for Iran  •  Sentinel-5P / TROPOMI  •  airsat.ir", selected_font=font(17, bold=True), fill="#6b8195", anchor="mt")
     image.save(output, "PNG", optimize=True)
+
 
 def write_shortcut(folder: Path) -> Path:
     windows_shortcut = folder / "AirSat.url"
@@ -1099,57 +1179,37 @@ def draw_header(
     title_fa: str,
     generated_at: str,
 ) -> None:
-    """Draw the shared AirSat report header without an image logo.
-
-    The time-series and map reports deliberately use the same restrained
-    textual wordmark so the title area remains uncluttered.
-    """
-    header = (30, 28, width - 30, 174)
-    draw_gradient_round_rect(image, header, 30, REPORT_BLUE_TOP, REPORT_BLUE_BOTTOM)
+    pad = 72
+    header_h = 155
+    header = (pad, pad, width - pad, pad + header_h)
+    draw_gradient_round_rect(image, header, 28, "#053d7b", "#2aa9e8")
 
     draw_ltr(
         draw,
-        70,
-        58,
+        106,
+        106,
         "Sentinel-5P / TROPOMI  •  Google Earth Engine  •  airsat.ir",
-        selected_font=font(16),
-        fill="white",
+        selected_font=font(18),
+        fill="#d9efff",
     )
-    draw_ltr(
-        draw,
-        70,
-        108,
-        generated_at,
-        selected_font=font(14),
-        fill="#d9ecff",
-    )
+    draw_ltr(draw, 106, 148, generated_at, selected_font=font(16), fill="#c1e2f8")
 
-    # Textual brand only; no graphic logo or watermark.
     draw_ltr(
         draw,
-        width - 280,
-        49,
+        width - 192,
+        98,
         "AirSat",
-        selected_font=font(42, bold=True),
+        selected_font=font(44, bold=True),
         fill="white",
+        anchor="rt",
     )
-    draw_ltr(
+    draw_rtl(
         draw,
-        width - 280,
-        104,
-        "Satellite-powered air monitoring",
-        selected_font=font(13),
-        fill="#d9ecff",
-    )
-
-    # A broad, collision-safe title area shared by both report types.
-    draw_centered_rtl(
-        draw,
-        width / 2,
-        90,
+        width - 192,
+        151,
         title_fa,
-        selected_font=font(24, bold=True),
-        fill="white",
+        selected_font=font(29, bold=True),
+        fill="#edf8ff",
     )
 
 
@@ -1202,19 +1262,17 @@ def compose_preview(
     end: str,
     bbox: tuple[float, float, float, float],
 ) -> None:
-    width, height = 1600, 1200
-    image = Image.new("RGB", (width, height), "#dfe7ef")
-    draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((30, 26, width - 30, height - 26), radius=32, fill="#eef3f8")
+    width, height = 1800, 1260
+    image, draw = draw_report_background(width, height)
+    pollutant_fa = POLLUTANT_FA[row["pollutant"]]
+    province = row.get("province_name") or "کل کشور"
+    title = f"نقشه مکانی {pollutant_fa} در استان {province}"
+    draw_header(image, draw, width, title, generated_time_fa())
 
-    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d، %H:%M UTC")
-    title = f"نقشه مکانی {POLLUTANT_FA[row['pollutant']]} در استان {row.get('province_name')}"
-    draw_header(image, draw, width, title, generated)
-
-    body = (60, 200, width - 60, 858)
-    draw.rounded_rectangle(body, radius=28, fill="#fbfdff", outline=REPORT_LINE, width=2)
-    map_box = (92, 230, width - 92, 813)
-    map_width, map_height = map_box[2] - map_box[0], map_box[3] - map_box[1]
+    map_x, map_y, map_w, map_h = 106, 260, 1588, 710
+    draw.rounded_rectangle((map_x, map_y, map_x + map_w, map_y + map_h), radius=22, fill="#fbfdff", outline="#d8e6f1", width=2)
+    content_box = (map_x + 38, map_y + 28, map_x + map_w - 38, map_y + map_h - 28)
+    map_width, map_height = content_box[2] - content_box[0], content_box[3] - content_box[1]
 
     try:
         basemap = build_osm_basemap(bbox, map_width, map_height)
@@ -1225,62 +1283,50 @@ def compose_preview(
         draw_centered_rtl(fallback_draw, map_width / 2, map_height / 2 - 14, "نقشه پایه موقتاً در دسترس نیست", selected_font=font(20), fill="#60788f")
 
     raw = Image.open(raw_png).convert("RGBA").resize((map_width, map_height), Image.Resampling.LANCZOS)
-    alpha = raw.getchannel("A").point(
-        lambda value: round(value * REPORT_OVERLAY_OPACITY)
-    )
+    original_alpha = raw.getchannel("A")
+    alpha = original_alpha.point(lambda value: round(value * REPORT_OVERLAY_OPACITY))
     raw.putalpha(alpha)
     composed = basemap.convert("RGBA")
     composed.alpha_composite(raw)
 
-    # Province boundary extracted from the overlay mask.
-    edge = alpha.filter(ImageFilter.FIND_EDGES).point(lambda value: 255 if value > 28 else 0)
-    boundary = Image.new("RGBA", raw.size, (15, 80, 145, 0))
+    # Province boundary from the outer mask edge only.
+    province_mask = original_alpha.point(lambda value: 255 if value > 4 else 0)
+    edge = province_mask.filter(ImageFilter.MaxFilter(7)).filter(ImageFilter.FIND_EDGES).point(lambda value: 255 if value > 32 else 0)
+    boundary = Image.new("RGBA", raw.size, (15, 90, 150, 0))
     boundary.putalpha(edge)
     composed.alpha_composite(boundary)
 
-    image.paste(composed.convert("RGB"), (map_box[0], map_box[1]))
-    draw.rounded_rectangle(map_box, radius=18, outline="#b9c8d6", width=2)
+    image.paste(composed.convert("RGB"), (content_box[0], content_box[1]))
+    draw.rectangle(content_box, outline="#c5d5e2", width=2)
 
-    # Map decorations and mandatory attribution.
-    draw.text((map_box[0] + 14, map_box[3] - 27), "© OpenStreetMap contributors", fill="#34495e", font=font(13))
-    draw.text((map_box[2] - 52, map_box[1] + 18), "N", fill="#153c60", font=font(18, bold=True))
-    draw.polygon([
-        (map_box[2] - 42, map_box[1] + 45),
-        (map_box[2] - 52, map_box[1] + 76),
-        (map_box[2] - 32, map_box[1] + 76),
-    ], fill="#153c60")
+    # Legend, matching the browser export.
+    legend_w = 430
+    legend_x = content_box[0] + 34
+    legend_y = content_box[1] + 38
+    draw.rounded_rectangle((legend_x - 18, legend_y - 18, legend_x + legend_w + 18, legend_y + 82), radius=16, fill=(255, 255, 255), outline="#c8d8e5", width=2)
+    draw_rtl(draw, legend_x + legend_w, legend_y - 8, f"{pollutant_fa} — {cfg['unit']}", selected_font=font(16, bold=True), fill="#29455f")
+    draw_color_legend(image, draw, (legend_x, legend_y + 24, legend_x + legend_w, legend_y + 40), cfg)
 
-    legend_box = (map_box[0] + 28, map_box[1] + 25, map_box[0] + 310, map_box[1] + 44)
-    draw_color_legend(image, draw, legend_box, cfg)
-    draw_rtl(draw, legend_box[2], legend_box[1] - 29, "راهنمای شدت آلاینده", selected_font=font(16, bold=True), fill="#28435d")
+    draw_ltr(draw, content_box[2] - 42, content_box[1] + 18, "N", selected_font=font(20, bold=True), fill="#153c60", anchor="mt")
+    draw.polygon([(content_box[2] - 42, content_box[1] + 50), (content_box[2] - 54, content_box[1] + 84), (content_box[2] - 30, content_box[1] + 84)], fill="#153c60")
+    draw_ltr(draw, content_box[0] + 14, content_box[3] - 28, "© OpenStreetMap contributors", selected_font=font(13), fill="#43596e")
 
-    footer_top, footer_bottom = 892, 1125
-    draw.rounded_rectangle((60, footer_top, width - 60, footer_bottom), radius=22, fill="#dde7f0", outline="#c2d0de", width=1)
-    divider_x = 790
-    draw.line((divider_x, footer_top + 22, divider_x, footer_bottom - 22), fill="#c0cfdd", width=2)
+    meta_y, meta_h = 994, 188
+    draw.rounded_rectangle((map_x, meta_y, map_x + map_w, meta_y + meta_h), radius=20, fill="#edf5fb", outline="#d7e6f1", width=2)
+    right_x, left_x = width - 130, 130
+    draw_rtl(draw, right_x, meta_y + 28, f"آلاینده: {pollutant_fa}   |   استان: {province}", selected_font=font(20, bold=True), fill="#17324d")
+    draw_label_value_rtl(draw, right_x, meta_y + 68, "واحد:", cfg["unit"], label_font=font(18), value_font=font(18), fill="#405a72")
+    draw_label_value_rtl(draw, right_x - 300, meta_y + 68, "بازه:", period_fa(row.get("period_key"), start, end), label_font=font(18), value_font=font(18), fill="#405a72")
+    draw_ltr(draw, right_x, meta_y + 108, f"Start: {start}   |   End: {end}", selected_font=font(17), fill="#405a72", anchor="rt")
 
-    draw_rtl(draw, 740, footer_top + 25, "مشخصات مکانی و زمانی", selected_font=font(20, bold=True), fill=REPORT_INK)
-    draw_label_value_rtl(draw, 740, footer_top + 70, "استان:", row.get("province_name"), label_font=font(17), value_font=font(17))
-    draw_label_value_rtl(draw, 740, footer_top + 108, "بازه:", period_fa(row.get("period_key"), start, end), label_font=font(17), value_font=font(17))
-    draw_label_value_rtl(draw, 740, footer_top + 146, "شروع:", start, label_font=font(17), value_font=font(17))
-    draw_label_value_rtl(draw, 740, footer_top + 184, "پایان:", end, label_font=font(17), value_font=font(17))
+    draw_rtl(draw, left_x + 600, meta_y + 28, "مشخصات تصویر", selected_font=font(20, bold=True), fill="#17324d")
+    draw_rtl(draw, left_x + 600, meta_y + 68, "شفافیت لایه آلاینده: ۸۰٪", selected_font=font(17), fill="#405a72")
+    draw_ltr(draw, left_x, meta_y + 108, "Source: Sentinel-5P / TROPOMI • Google Earth Engine • OpenStreetMap", selected_font=font(15), fill="#64748b")
 
-    draw_rtl(draw, width - 92, footer_top + 25, "مشخصات داده", selected_font=font(20, bold=True), fill=REPORT_INK)
-    draw_label_value_rtl(draw, width - 92, footer_top + 70, "آلاینده:", row["pollutant"], label_font=font(17), value_font=font(17))
-    draw_label_value_rtl(draw, width - 92, footer_top + 108, "واحد:", cfg["unit"], label_font=font(17), value_font=font(17))
-    draw_label_value_rtl(
-        draw,
-        width - 92,
-        footer_top + 146,
-        "شفافیت لایه:",
-        f"{round(REPORT_OVERLAY_OPACITY * 100)}%",
-        label_font=font(17),
-        value_font=font(17),
-    )
-    draw_ltr(draw, 850, footer_top + 184, "Sentinel-5P / TROPOMI • Google Earth Engine", selected_font=font(15), fill="#526b83")
-
-    draw.text((70, height - 48), "© AirSat  •  OpenStreetMap contributors  •  airsat.ir", fill="#6f8396", font=font(16))
+    draw.rectangle((72, 1126, width - 72, 1188), fill="#f5f9fc")
+    draw_ltr(draw, width / 2, 1147, "© AirSat  •  Satellite-powered air monitoring for Iran  •  airsat.ir", selected_font=font(17, bold=True), fill="#6b8195", anchor="mt")
     image.save(output_png, "PNG", optimize=True)
+
 
 def safe_filename(value: str) -> str:
     value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
@@ -1607,7 +1653,8 @@ def main() -> None:
             thumbnail_url = visual.getThumbURL(
                 {
                     "region": render_region,
-                    "dimensions": "1416x595",
+                    "dimensions": "1512x654",
+                    "crs": "EPSG:3857",
                     "format": "png",
                 }
             )
