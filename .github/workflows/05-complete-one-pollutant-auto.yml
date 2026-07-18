@@ -32,9 +32,9 @@ on:
         type: boolean
 
   # Daily self-healing and freshness refresh.
-  # Minute 30 avoids the common top-of-hour scheduling peak.
+  # Minute 17 avoids the common top-of-hour scheduling peak.
   schedule:
-    - cron: "30 20 * * *"
+    - cron: "17 2 * * *"
 
 permissions:
   contents: read
@@ -117,7 +117,8 @@ jobs:
       AIRSAT_THUMB_DIMENSIONS: "1200"
       AIRSAT_VISUAL_EXPORT_DIMENSIONS: "1200,1000,800,650"
       AIRSAT_DOWNLOAD_TIMEOUT: "420"
-      AIRSAT_MAX_DOWNLOAD_ATTEMPTS: "1"
+      AIRSAT_MAX_DOWNLOAD_ATTEMPTS: "2"
+      PYTHONUNBUFFERED: "1"
       AIRSAT_STATS_SCALE: "7000"
       AIRSAT_STATS_CRS: "EPSG:4326"
       AIRSAT_WEB_CRS: "EPSG:3857"
@@ -159,7 +160,22 @@ jobs:
           pip install -r runner/requirements-actions.txt
 
       - name: Build and strictly validate one independent unit
+        id: build_unit
+        shell: bash
         run: |
+          set +e
+          mkdir -p airsat-diagnostics
+          safe_name="${{ matrix.task.pollutant }}_${{ matrix.task.period_key }}"
+          log_file="airsat-diagnostics/${safe_name}.log"
+
+          echo "AirSat diagnostic log: $log_file"
+          echo "Task reason: ${{ matrix.task.reason }}"
+          echo "Task kind: ${{ matrix.task.kind }}"
+          echo "Pollutant: ${{ matrix.task.pollutant }}"
+          echo "Period: ${{ matrix.task.period_key }}"
+          echo "Year: ${{ matrix.task.year }}"
+          echo "Months: ${{ matrix.task.months }}"
+
           python runner/scripts/run_airsat_task.py \
             --root target \
             --runner-root runner \
@@ -170,7 +186,52 @@ jobs:
             --months "${{ matrix.task.months }}" \
             --timeseries-periods "${{ matrix.task.timeseries_periods }}" \
             --attempts 2 \
-            --attempt-timeout-seconds 7800
+            --attempt-timeout-seconds 7800 \
+            2>&1 | tee "$log_file"
+
+          status=${PIPESTATUS[0]}
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+
+          if [ "$status" -ne 0 ]; then
+            echo "::error title=AirSat ${{ matrix.task.pollutant }} ${{ matrix.task.period_key }} failed::Open the Job Summary or download the airsat-diagnostic artifact for the exact error."
+            echo "::group::Last 160 diagnostic lines"
+            tail -n 160 "$log_file" || true
+            echo "::endgroup::"
+
+            {
+              echo "### ❌ AirSat task failed"
+              echo "- Pollutant: **${{ matrix.task.pollutant }}**"
+              echo "- Unit: **${{ matrix.task.period_key }}**"
+              echo "- Kind: **${{ matrix.task.kind }}**"
+              echo "- Planner reason: `${{ matrix.task.reason }}`"
+              echo "- Exit code: **$status**"
+              echo ""
+              echo "<details><summary>آخرین 160 خط خطا</summary>"
+              echo ""
+              echo '```text'
+              tail -n 160 "$log_file" || true
+              echo '```'
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### ✅ AirSat task completed"
+              echo "- Pollutant: **${{ matrix.task.pollutant }}**"
+              echo "- Unit: **${{ matrix.task.period_key }}**"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          exit "$status"
+
+      - name: Upload full diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: airsat-diagnostic-${{ matrix.task.pollutant }}-${{ matrix.task.period_key }}-${{ github.run_id }}
+          path: |
+            airsat-diagnostics
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Commit this validated unit immediately
         working-directory: target
@@ -256,7 +317,37 @@ jobs:
           fi
 
       - name: Enforce health for the selected pollutants
+        id: strict_audit
+        shell: bash
         run: |
+          set +e
+          mkdir -p airsat-audit-diagnostics
           python runner/scripts/audit_airsat_data.py \
             --root target \
-            --strict-pollutants "${{ needs.prepare.outputs.selected_pollutants }}"
+            --strict-pollutants "${{ needs.prepare.outputs.selected_pollutants }}" \
+            2>&1 | tee airsat-audit-diagnostics/audit.log
+          status=${PIPESTATUS[0]}
+
+          if [ "$status" -ne 0 ]; then
+            echo "::error title=AirSat data contract audit failed::See Job Summary and the airsat-audit-diagnostic artifact."
+            {
+              echo "### ❌ AirSat data audit failed"
+              echo "- Pollutants: **${{ needs.prepare.outputs.selected_pollutants }}**"
+              echo ""
+              echo '```text'
+              tail -n 180 airsat-audit-diagnostics/audit.log || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$status"
+
+      - name: Upload audit diagnostic report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: airsat-audit-diagnostic-${{ github.run_id }}
+          path: |
+            airsat-audit-diagnostics
+            target/public/data/health/data-health.json
+          if-no-files-found: warn
+          retention-days: 14
