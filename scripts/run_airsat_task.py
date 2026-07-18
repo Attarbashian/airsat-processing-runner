@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,14 +22,38 @@ def run(
     env: dict[str, str],
     timeout: int,
 ) -> None:
-    print("+", " ".join(command), flush=True)
-    subprocess.run(
-        command,
-        cwd=cwd,
-        env=env,
-        check=True,
-        timeout=timeout,
+    printable = " ".join(shlex.quote(str(part)) for part in command)
+    print(f"[AirSat command] {printable}", flush=True)
+    print(f"[AirSat cwd] {cwd}", flush=True)
+    started = time.monotonic()
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        elapsed = time.monotonic() - started
+        message = (
+            f"TIMEOUT after {elapsed:.1f}s (limit={timeout}s): {printable}"
+        )
+        print(f"::error title=AirSat task timeout::{message}", file=sys.stderr, flush=True)
+        raise RuntimeError(message) from error
+
+    elapsed = time.monotonic() - started
+    print(
+        f"[AirSat command finished] exit_code={completed.returncode} "
+        f"duration={elapsed:.1f}s",
+        flush=True,
     )
+    if completed.returncode != 0:
+        message = (
+            f"PROCESS_EXIT code={completed.returncode}: {printable}"
+        )
+        print(f"::error title=AirSat subprocess failed::{message}", file=sys.stderr, flush=True)
+        raise RuntimeError(message)
 
 
 def clean_target(root: Path) -> None:
@@ -106,6 +132,38 @@ def validation_command(args: argparse.Namespace) -> list[str]:
         )
 
     return command
+
+
+def write_failure_record(
+    args: argparse.Namespace,
+    attempt: int,
+    duration_seconds: float,
+    error: BaseException,
+) -> None:
+    diagnostics_dir = args.root.parent / "airsat-diagnostics"
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    path = diagnostics_dir / f"{args.pollutant}_{args.period_key}.failure.json"
+    payload = {
+        "status": "failed",
+        "pollutant": args.pollutant,
+        "kind": args.kind,
+        "period_key": args.period_key,
+        "year": args.year or None,
+        "months": args.months or None,
+        "attempt": attempt,
+        "duration_seconds": round(duration_seconds, 2),
+        "error_type": type(error).__name__,
+        "error": str(error),
+        "traceback": traceback.format_exc(),
+        "failed_at_utc": datetime.now(timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z"),
+    }
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"[AirSat failure record] {path}", file=sys.stderr, flush=True)
 
 
 def write_success_record(
@@ -196,25 +254,39 @@ def main() -> None:
             )
             return
 
-        except (
-            subprocess.CalledProcessError,
-            subprocess.TimeoutExpired,
-            RuntimeError,
-        ) as error:
+        except BaseException as error:
             last_error = error
+            duration = time.monotonic() - started
+            write_failure_record(args, attempt, duration, error)
             print(
-                f"Attempt {attempt} failed: {error!r}",
+                "\n" + "=" * 78 + "\n"
+                f"AIRSat TASK FAILURE\n"
+                f"pollutant={args.pollutant}\n"
+                f"kind={args.kind}\n"
+                f"period_key={args.period_key}\n"
+                f"year={args.year or '-'}\n"
+                f"months={args.months or '-'}\n"
+                f"attempt={attempt}/{args.attempts}\n"
+                f"duration_seconds={duration:.1f}\n"
+                f"error_type={type(error).__name__}\n"
+                f"error={error}\n"
+                + "=" * 78,
                 file=sys.stderr,
                 flush=True,
             )
+            traceback.print_exc(file=sys.stderr)
             if attempt < args.attempts:
                 delay = 45 * attempt
                 print(f"Retrying after {delay} seconds.", flush=True)
                 time.sleep(delay)
 
-    raise RuntimeError(
-        f"AirSat task failed after {args.attempts} attempts: {last_error!r}"
+    final_message = (
+        f"AirSat task failed after {args.attempts} attempts | "
+        f"pollutant={args.pollutant} | period={args.period_key} | "
+        f"last_error={type(last_error).__name__}: {last_error}"
     )
+    print(f"::error title=AirSat task permanently failed::{final_message}", file=sys.stderr, flush=True)
+    raise RuntimeError(final_message)
 
 
 if __name__ == "__main__":
