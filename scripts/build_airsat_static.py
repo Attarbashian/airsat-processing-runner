@@ -2,7 +2,7 @@
 """AirSat static pipeline with QA, georeferenced web images and validation."""
 from __future__ import annotations
 
-import hashlib, io, json, os, re, time, zipfile
+import hashlib, io, json, math, os, re, time, zipfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -15,7 +15,7 @@ from PIL import Image
 from rasterio.io import MemoryFile
 from rasterio.warp import transform_bounds
 
-PIPELINE_VERSION = "airsat-pipeline-v7.0-reliable-atomic-self-healing"
+PIPELINE_VERSION = "airsat-pipeline-v7.3-observed-plus-flagged-temporal-gap-repair"
 ROOT = Path(os.environ.get("AIRSAT_REPOSITORY_ROOT", str(Path(__file__).resolve().parents[1]))).expanduser().resolve()
 PUBLIC = ROOT / "public"
 DATA = PUBLIC / "data"
@@ -236,8 +236,21 @@ def dynamic_periods(latest: date):
         "current_year":{"label_fa":"سال جاری","start":date(latest.year,1,1),"end":end,"group":"dynamic","data_latest_date":latest},
     }
 
+def first_supported_month(cfg):
+    """Return the first month expected to have meaningful monthly coverage.
+
+    Products that begin in the final half of a month are treated as starting
+    from the following full month. This prevents a partial launch month (for
+    example CO/NO2 June 2018, starting on the 28th) from being misclassified
+    as a failed monthly product.
+    """
+    start = dataset_start_date(cfg)
+    month = start.replace(day=1)
+    return add_months(month, 1) if start.day > 15 else month
+
+
 def monthly_periods_from_start(cfg):
-    start = dataset_start_date(cfg).replace(day=1)
+    start = first_supported_month(cfg)
     current = max(date(START_YEAR, 1, 1), start)
     stop = NOW.date().replace(day=1)
     out = []
@@ -730,6 +743,95 @@ def build_layer(pid,cfg,key,pinfo,country,fc):
     })
     return layer
 
+def _finite_number(value):
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _month_index(period):
+    year, month = (int(part) for part in str(period).split("-"))
+    return year * 12 + month - 1
+
+
+def _linear_value(left, right, field, ratio, default=None):
+    left_value = left.get(field)
+    right_value = right.get(field)
+    if _finite_number(left_value) and _finite_number(right_value):
+        return float(left_value) + ratio * (float(right_value) - float(left_value))
+    return default
+
+
+def repair_selected_temporal_gaps(table, selected_labels, max_support_span_months=6):
+    """Fill isolated province-month gaps with explicitly flagged interpolation.
+
+    The scientific observations are never overwritten. A missing monthly
+    provincial value is repaired only when it is bracketed by two numeric
+    monthly observations no more than ``max_support_span_months`` apart.
+    Every repaired point is marked ``interpolated=true`` and records its two
+    supporting months. Edge gaps and long unsupported gaps remain missing.
+    """
+    repaired = []
+    unresolved = []
+    selected = sorted(set(selected_labels), key=_month_index)
+
+    for item in table.values():
+        series = item.get("series") or []
+        numeric_by_period = {
+            str(point.get("period")): point
+            for point in series
+            if point.get("period") and _finite_number(point.get("value"))
+        }
+        observed = sorted(
+            (
+                (_month_index(period), period, point)
+                for period, point in numeric_by_period.items()
+            ),
+            key=lambda value: value[0],
+        )
+
+        for period in selected:
+            if period in numeric_by_period:
+                continue
+            target_index = _month_index(period)
+            left_candidates = [entry for entry in observed if entry[0] < target_index]
+            right_candidates = [entry for entry in observed if entry[0] > target_index]
+            if not left_candidates or not right_candidates:
+                unresolved.append(f"{item.get('name_fa') or item.get('id')}:{period}")
+                continue
+
+            left_index, left_period, left_point = left_candidates[-1]
+            right_index, right_period, right_point = right_candidates[0]
+            span = right_index - left_index
+            if span <= 0 or span > max_support_span_months:
+                unresolved.append(f"{item.get('name_fa') or item.get('id')}:{period}")
+                continue
+
+            ratio = (target_index - left_index) / span
+            value = _linear_value(left_point, right_point, "value", ratio)
+            if not _finite_number(value):
+                unresolved.append(f"{item.get('name_fa') or item.get('id')}:{period}")
+                continue
+            minimum = _linear_value(left_point, right_point, "min", ratio, value)
+            maximum = _linear_value(left_point, right_point, "max", ratio, value)
+            point = {
+                "period": period,
+                "value": value,
+                "min": minimum,
+                "max": maximum,
+                "image_count": 0,
+                "interpolated": True,
+                "interpolation_method": "linear_temporal_between_observed_months",
+                "interpolation_support": [left_period, right_period],
+                "interpolation_ratio": round(ratio, 6),
+            }
+            series.append(point)
+            repaired.append(f"{item.get('name_fa') or item.get('id')}:{period}")
+
+    return repaired, unresolved
+
+
 def build_ts(pid,cfg,fc,country,province_catalog):
     periods = monthly_periods_from_start(cfg)
     if not periods:
@@ -772,6 +874,20 @@ def build_ts(pid,cfg,fc,country,province_catalog):
                 "period":label,"value":row["mean"],"min":row["min"],"max":row["max"],
                 "image_count":count,"interpolated":False
             })
+    repaired, unresolved = repair_selected_temporal_gaps(table, selected_labels)
+    if repaired:
+        print(
+            f"Time-series temporal gap repair: {len(repaired)} flagged points; "
+            + ", ".join(repaired[:12])
+            + (" ..." if len(repaired) > 12 else "")
+        )
+    if unresolved:
+        print(
+            f"Time-series unresolved gaps: {len(unresolved)}; "
+            + ", ".join(unresolved[:12])
+            + (" ..." if len(unresolved) > 12 else "")
+        )
+
     for item in table.values():
         item["series"] = sorted(
             item.get("series") or [],
@@ -787,6 +903,14 @@ def build_ts(pid,cfg,fc,country,province_catalog):
         "qa_applied_in_pipeline":False,"stats_crs":STATS_CRS,"stats_scale":STATS_SCALE,
         "stats_schema_version":2,"pipeline_version":PIPELINE_VERSION,
         "dataset_start":cfg["dataset_start"],
+        "first_expected_month":first_supported_month(cfg).strftime("%Y-%m"),
+        "temporal_gap_policy":{
+            "method":"linear_temporal_between_observed_months",
+            "maximum_support_span_months":6,
+            "observations_overwritten":False,
+            "repaired_points":len(repaired),
+            "unresolved_points":len(unresolved),
+        },
         "generated_at_utc":NOW.isoformat().replace("+00:00","Z"),
         "provinces":provinces
     })

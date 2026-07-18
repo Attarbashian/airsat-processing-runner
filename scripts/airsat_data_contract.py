@@ -121,8 +121,19 @@ def last_completed_month(today: date | None = None) -> date:
     return first_this_month - timedelta(days=1)
 
 
+def first_supported_month(pollutant: str) -> date:
+    """First month with enough product days for a monthly statistic."""
+    start_date = POLLUTANT_START_DATES[pollutant]
+    first = start_date.replace(day=1)
+    if start_date.day > 15:
+        if first.month == 12:
+            return date(first.year + 1, 1, 1)
+        return date(first.year, first.month + 1, 1)
+    return first
+
+
 def expected_months(pollutant: str, today: date | None = None) -> list[str]:
-    start = POLLUTANT_START_DATES[pollutant].replace(day=1)
+    start = first_supported_month(pollutant)
     stop = last_completed_month(today).replace(day=1)
     periods: list[str] = []
     current = start

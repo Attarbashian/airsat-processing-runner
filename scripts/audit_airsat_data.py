@@ -187,7 +187,7 @@ def main() -> int:
     health_payload = {
         "status": "healthy" if not issues else "degraded",
         "generated_at_utc": now.isoformat().replace("+00:00", "Z"),
-        "contract_version": "airsat-data-contract-v7.0",
+        "contract_version": "airsat-data-contract-v7.3",
         "summary": {
             "pollutants_total": len(POLLUTANTS),
             "pollutants_healthy": healthy_pollutants,
