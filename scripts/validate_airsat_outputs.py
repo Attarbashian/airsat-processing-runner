@@ -263,6 +263,15 @@ def main() -> int:
     groups = parse_groups(args.groups)
     periods = parse_periods(args.periods)
     required_timeseries_periods = parse_periods(args.timeseries_periods)
+
+    # A segmented time-series task may intentionally build fewer than 12 months
+    # (for example one half-year, or the first partial year of a Sentinel-5P
+    # product). Validate the requested unit itself here; the final global audit
+    # is responsible for enforcing the complete historical contract.
+    effective_min_series_points = args.min_series_points
+    if required_timeseries_periods is not None:
+        effective_min_series_points = len(required_timeseries_periods)
+
     layers = read_json(CATALOG).get("layers", [])
     if selected is not None:
         layers = [l for l in layers if str(l.get("pollutant", "")).upper() in selected]
@@ -305,7 +314,7 @@ def main() -> int:
                 validate_timeseries(
                     pollutant,
                     expected,
-                    args.min_series_points,
+                    effective_min_series_points,
                     required_timeseries_periods,
                 )
             )

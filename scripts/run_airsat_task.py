@@ -113,12 +113,19 @@ def validation_command(args: argparse.Namespace) -> list[str]:
     ]
 
     if args.kind == "timeseries":
+        requested_periods = [
+            item.strip()
+            for item in args.timeseries_periods.split(",")
+            if item.strip()
+        ]
         command.extend(
             [
                 "--require-timeseries",
                 "--skip-layers",
                 "--timeseries-periods",
                 args.timeseries_periods,
+                "--min-series-points",
+                str(len(requested_periods) or 1),
             ]
         )
     else:
